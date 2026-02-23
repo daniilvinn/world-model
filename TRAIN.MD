@@ -14,7 +14,7 @@ The pipeline has five stages:
 4. **Dynamics training** — Train world model (flow matching)
 5. **Playback** — Run the AI-driven game
 
-Approximate timings on RTX 5070 Ti: data collection ~5–6 min (100K frames), VQ-VAE ~2–3 h, precompute ~10–20 min, dynamics ~4–6 h.
+Approximate timings on RTX 5070 Ti: data collection ~5–6 min (100K frames), VQ-VAE ~8-10 hours, precompute ~10–20 min, dynamics ~12 hours.
 
 ---
 
@@ -341,7 +341,7 @@ python game.py --vqvae --checkpoint path/to/vqvae.pt
 ### Out of Memory (OOM)
 
 - **VQ-VAE:** Reduce `--batch_size` (e.g. 4)
-- **Dynamics:** Reduce `--batch_size` (e.g. 32)
+- **Dynamics:** Reduce `--batch_size` (e.g. 32), adjust sequence rollout length, configured by `--rollout_length`, also try to tune context length by configuring `--context_length`. **Please note**, that both rollout length and context size directly impact dynamics' model performance. 
 
 ### Checkpoint Paths
 
@@ -350,6 +350,8 @@ Ensure paths match: `--data_dir`, `--checkpoint`, `--latents_dir`, `--vqvae_chec
 ### Windows + torch.compile
 
 On Windows, the dynamics script uses `backend="eager"` to avoid Triton issues. Use `--no_compile` if you see compile errors.
+
+Proper Triton support will be added soon.
 
 ### Early Stopping
 
