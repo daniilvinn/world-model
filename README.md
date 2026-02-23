@@ -88,7 +88,7 @@ World/
 | Step | Script | What it does |
 |------|--------|--------------|
 | 1 | `collect_dataset.py` | Auto-play headless game, save frame pairs as `.npz` |
-| 2 | `python -m vqvae.train` | Compress frames to latent space |
+| 2 | `python -m vqvae.train` | Train VQ-VAE model on raw frame data |
 | 3 | `precompute_latents.py` | Encode all frames to indices, create `latents/` and `seeds.pt` |
 | 4 | `python -m dynamics.train` | Train flow-matching model on latent sequences |
 | 5 | `play_world_model.py` | Autoregressive generation: context → dynamics → decode → display |
@@ -108,15 +108,6 @@ python quickstart.py
 ```
 
 The quickstart script checks your current progress and suggests the next step (collect data, train VQ-VAE, precompute latents, train dynamics, or play).
-
----
-
-## 📦 Dependencies
-
-| File | Purpose |
-|------|---------|
-| `requirements.txt` | Base: `pygame`, `numpy`, `pymunk` (game only) |
-| `requirements_vqvae.txt` | Full: `torch`, `torchvision`, `lpips`, `tensorboard`, `matplotlib`, etc. |
 
 ---
 
