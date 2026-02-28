@@ -18,6 +18,72 @@ Approximate timings on RTX 5070 Ti: data collection ~5–6 min (100K frames), VQ
 
 ---
 
+## W&B Setup
+
+All training and evaluation logs are sent to **Weights & Biases**. TensorBoard has been replaced.
+
+### Environment Variables
+
+Set these before training:
+
+```bash
+# Required
+export WANDB_API_KEY="your-api-key-here"
+
+# Optional (defaults shown)
+export WANDB_PROJECT="world-model"
+export WANDB_ENTITY="your-team"
+export WANDB_RUN_GROUP="experiment-group"
+export WANDB_TAGS="tag1,tag2"
+```
+
+On Windows (PowerShell):
+
+```powershell
+$env:WANDB_API_KEY = "your-api-key-here"
+$env:WANDB_PROJECT = "world-model"
+```
+
+### wandb_config.json
+
+Evaluation cadence and heavy-metric scheduling is controlled by `wandb_config.json` in the project root:
+
+```json
+{
+    "metrics_gather_frequency": 5,
+    "gradient_stats": {
+        "enabled": true,
+        "frequency": 50
+    }
+}
+```
+
+Key settings:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `metrics_gather_frequency` | 5 | Run heavy metrics (FID, FVD, etc.) every N epochs |
+| `gradient_stats.enabled` | true | Log gradient norm/mean/std/max |
+| `gradient_stats.frequency` | 50 | Log gradient stats every N steps |
+| `rollout.short_horizons` | [1,4,8,16,32,64] | Rollout horizons for per-step metrics |
+| `rollout.fvd_clip_lengths` | [16,32,64,128,256,512] | FVD clip lengths |
+| `artifacts.log_best` | true | Upload best checkpoint to W&B |
+
+### W&B Dashboard Structure
+
+All metrics are organized into folders:
+
+- **Optimization/** — Train/val losses, learning rate, gradient statistics
+- **Inference/** — One-step and rollout generation quality
+- **Evaluation/** — Benchmark metrics (FID, KID, FVD, codebook stats, etc.)
+- **Runtime/** — FPS, frame time, VRAM usage
+
+### Disabling W&B
+
+Pass `--no_wandb` to any training or evaluation command to run without W&B logging.
+
+---
+
 ## 1. Data Collection
 
 Collect frame pairs `(frame_t0, frame_t1, action, ...)` from the headless game.
@@ -107,10 +173,13 @@ python -m vqvae.train [OPTIONS]
 | `--warmup_steps` | 500 | Linear warmup steps |
 | `--patience` | 10 | Early stopping patience |
 | **Logging** | | |
-| `--log_every` | 50 | TensorBoard log interval |
-| `--log_dir` | runs/vqvae | TensorBoard log dir |
+| `--log_every` | 50 | W&B log interval (steps) |
 | `--checkpoint_dir` | checkpoints | Checkpoint save dir |
 | `--recon_dir` | reconstructions | Reconstruction grid dir |
+| **W&B** | | |
+| `--wandb_config` | wandb_config.json | Eval config path |
+| `--run_name` | None | W&B run name |
+| `--no_wandb` | — | Disable W&B |
 | **Resume** | | |
 | `--resume` | None | Path to checkpoint to resume |
 
@@ -126,14 +195,16 @@ python -m vqvae.train --epochs 100 --batch_size 12
 # Resume from checkpoint
 python -m vqvae.train --resume checkpoints/vqvae_latest.pt
 
-# Subset for quick test
-python -m vqvae.train --max_samples 1000 --epochs 5
+# Subset for quick test (no W&B)
+python -m vqvae.train --max_samples 1000 --epochs 5 --no_wandb
 ```
 
 ### Monitoring
 
 ```bash
-tensorboard --logdir runs/
+# Open W&B dashboard (link printed at training start)
+# Or disable and use console output:
+python -m vqvae.train --no_wandb
 ```
 
 ### Outputs
@@ -232,9 +303,12 @@ python -m dynamics.train [OPTIONS]
 | **EMA** | | |
 | `--ema_decay` | 0.999 | EMA decay |
 | **Logging** | | |
-| `--log_every` | 50 | TensorBoard log interval |
-| `--log_dir` | runs/dynamics | TensorBoard log dir |
+| `--log_every` | 50 | W&B log interval (steps) |
 | `--checkpoint_dir` | checkpoints | Checkpoint save dir |
+| **W&B** | | |
+| `--wandb_config` | wandb_config.json | Eval config path |
+| `--run_name` | None | W&B run name |
+| `--no_wandb` | — | Disable W&B |
 | **Resume** | | |
 | `--resume` | None | Path to checkpoint to resume |
 
@@ -325,7 +399,31 @@ python -m vqvae.evaluate [OPTIONS]
 | `--num_images` | 8 | Number of images |
 | `--batch_size` | 16 | Batch size |
 | `--num_workers` | 4 | DataLoader workers |
-| `--full_res` | — | Also save 840×420 reconstructions |
+| `--full_res` | — | Also save 840x420 reconstructions |
+| `--heavy_metrics` | — | Compute FID / KID |
+| `--wandb_config` | wandb_config.json | Eval config path |
+| `--run_name` | None | W&B run name |
+| `--no_wandb` | — | Disable W&B |
+
+### Dynamics Evaluation
+
+```bash
+python -m dynamics.evaluate [OPTIONS]
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--dynamics_checkpoint` | checkpoints/dynamics_best.pt | Dynamics checkpoint |
+| `--vqvae_checkpoint` | checkpoints/vqvae_best.pt | VQ-VAE checkpoint |
+| `--latents_dir` | latents | Latents directory |
+| `--output_dir` | eval_output_dynamics | Output dir |
+| `--ode_steps` | 10 | ODE steps per frame |
+| `--eval_rollout_length` | 4 | Dataset rollout length |
+| `--num_eval_rollouts` | 20 | Rollouts to generate |
+| `--heavy_metrics` | — | FVD, optical flow, action metrics |
+| `--wandb_config` | wandb_config.json | Eval config path |
+| `--run_name` | None | W&B run name |
+| `--no_wandb` | — | Disable W&B |
 
 ### Original Game with VQ-VAE Overlay
 
@@ -336,12 +434,43 @@ python game.py --vqvae --checkpoint path/to/vqvae.pt
 
 ---
 
+## Heavy Metrics & Compute Cost
+
+Heavy metrics (FID, KID, FVD, optical flow) are expensive. The default `wandb_config.json` runs them every 5 epochs. Adjust for your hardware:
+
+| Metric | Approx. Cost | Default Frequency |
+|--------|-------------|-------------------|
+| FID/KID (5K samples) | ~2-5 min | Every 5 epochs |
+| FVD-64 | ~5-10 min | Every 10 epochs |
+| Optical flow EPE | ~3-5 min | Every 10 epochs |
+| Action metrics | ~1-2 min | Every 10 epochs |
+| Failure analysis | ~1-2 min | Every 10 epochs |
+
+To run all heavy metrics once (standalone evaluation):
+
+```bash
+python -m vqvae.evaluate --heavy_metrics
+python -m dynamics.evaluate --heavy_metrics
+```
+
+### Optional Dependencies
+
+For full metric coverage, install optional packages:
+
+```bash
+pip install torch-fidelity    # FID/KID
+pip install opencv-python     # Optical flow EPE
+pip install matplotlib        # Codebook histograms
+```
+
+---
+
 ## Troubleshooting
 
 ### Out of Memory (OOM)
 
 - **VQ-VAE:** Reduce `--batch_size` (e.g. 4)
-- **Dynamics:** Reduce `--batch_size` (e.g. 32), adjust sequence rollout length, configured by `--rollout_length`, also try to tune context length by configuring `--context_length`. **Please note**, that both rollout length and context size directly impact dynamics' model performance. 
+- **Dynamics:** Reduce `--batch_size` (e.g. 32), adjust sequence rollout length, configured by `--rollout_length`, also try to tune context length by configuring `--context_length`. **Please note**, that both rollout length and context size directly impact dynamics' model performance.
 
 ### Checkpoint Paths
 
@@ -356,3 +485,14 @@ Proper Triton support will be added soon.
 ### Early Stopping
 
 Both VQ-VAE and dynamics use early stopping. Adjust `--patience` to train longer or stop sooner.
+
+### W&B Offline Mode
+
+If you don't have internet during training:
+
+```bash
+export WANDB_MODE=offline
+python -m vqvae.train
+# Later, sync with:
+wandb sync runs/offline-run-*
+```

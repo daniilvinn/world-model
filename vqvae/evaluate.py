@@ -9,6 +9,9 @@ Features:
     1. Reconstruction grid: side-by-side original vs reconstructed at 256x512
     2. Full-resolution output: decode and resize to native 840x420
     3. Codebook statistics: usage histogram, utilization rate, perplexity
+    4. Single-frame metrics: PSNR, SSIM, LPIPS, MSE, MAE
+    5. FID / KID (when --heavy_metrics is set)
+    6. All results logged to W&B
 """
 
 import argparse
@@ -24,6 +27,24 @@ from tqdm import tqdm
 
 from vqvae.model import VQVAE
 from vqvae.dataset import create_dataloaders
+
+from evaluation.config import load_eval_config
+from evaluation.single_frame_metrics import (
+    evaluate_single_frame,
+    compute_codebook_stats,
+    compute_fid,
+    compute_kid,
+)
+from logger.wandb_logger import WandbLogger
+from logger.metric_names import M
+from logger.architecture import serialize_model_architecture
+
+
+def _repeat_to_min_samples(items: list, min_samples: int) -> list:
+    """Repeat elements cyclically so the returned list has at least min_samples."""
+    if min_samples <= 0 or len(items) >= min_samples or not items:
+        return items
+    return [items[i % len(items)] for i in range(min_samples)]
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +73,6 @@ def make_reconstruction_grid(model, val_loader, device, num_images=8):
 
     x_recon, _, _, _ = model(originals)
 
-    # Interleave: orig1, recon1, orig2, recon2, ...
     grid_images = []
     for i in range(num_images):
         grid_images.append(originals[i])
@@ -79,14 +99,6 @@ def make_reconstruction_grid(model, val_loader, device, num_images=8):
 def to_full_resolution(images_256x512):
     """
     Resize images from 256x512 to native 420x840 using bicubic interpolation.
-
-    Since 512:256 = 840:420 = 2:1, this introduces zero aspect ratio distortion.
-
-    Args:
-        images_256x512: Tensor [B, 3, 256, 512] in [-1, 1].
-
-    Returns:
-        images_420x840: Tensor [B, 3, 420, 840] as uint8 [0, 255].
     """
     images_full = F.interpolate(
         images_256x512,
@@ -95,7 +107,6 @@ def to_full_resolution(images_256x512):
         align_corners=False,
     ).clamp(-1, 1)
 
-    # Convert from [-1, 1] to [0, 255] uint8
     images_uint8 = ((images_full + 1.0) * 127.5).clamp(0, 255).byte()
     return images_uint8
 
@@ -117,26 +128,22 @@ def save_full_resolution_samples(model, val_loader, device, save_dir, num_images
 
     x_recon, _, _, _ = model(originals)
 
-    # Resize both to full resolution
     orig_full = to_full_resolution(originals)
     recon_full = to_full_resolution(x_recon)
 
     for i in range(num_images):
-        # Save original
-        orig_img = orig_full[i].permute(1, 2, 0).cpu().numpy()  # [420, 840, 3]
+        orig_img = orig_full[i].permute(1, 2, 0).cpu().numpy()
         from PIL import Image
         Image.fromarray(orig_img).save(
             os.path.join(save_dir, f"original_{i:03d}.png")
         )
 
-        # Save reconstruction
-        recon_img = recon_full[i].permute(1, 2, 0).cpu().numpy()  # [420, 840, 3]
+        recon_img = recon_full[i].permute(1, 2, 0).cpu().numpy()
         Image.fromarray(recon_img).save(
             os.path.join(save_dir, f"recon_{i:03d}.png")
         )
 
-        # Save side-by-side comparison
-        comparison = np.concatenate([orig_img, recon_img], axis=1)  # [420, 1680, 3]
+        comparison = np.concatenate([orig_img, recon_img], axis=1)
         Image.fromarray(comparison).save(
             os.path.join(save_dir, f"compare_{i:03d}.png")
         )
@@ -150,16 +157,9 @@ def save_full_resolution_samples(model, val_loader, device, save_dir, num_images
 
 
 @torch.no_grad()
-def compute_codebook_stats(model, val_loader, device):
+def compute_codebook_stats_full(model, val_loader, device):
     """
     Compute codebook utilization statistics over the full validation set.
-
-    Returns:
-        stats: Dictionary containing:
-            - usage_counts: [K] how many times each code is used
-            - utilization: fraction of codes used at least once
-            - perplexity: exp(entropy of usage distribution)
-            - total_tokens: total number of latent tokens processed
     """
     model.eval()
     num_embeddings = model.quantizer.num_embeddings
@@ -170,7 +170,6 @@ def compute_codebook_stats(model, val_loader, device):
         x = batch.to(device)
         z_e = model.encoder(x)
         _, _, indices, _ = model.quantizer(z_e)
-        # indices: [B, 32, 32]
         flat = indices.reshape(-1)
         usage_counts.scatter_add_(
             0, flat, torch.ones_like(flat, dtype=torch.long)
@@ -179,13 +178,11 @@ def compute_codebook_stats(model, val_loader, device):
 
     usage_counts = usage_counts.cpu()
 
-    # Utilization: fraction of codes used at least once
     used_codes = (usage_counts > 0).sum().item()
     utilization = used_codes / num_embeddings
 
-    # Perplexity: exp(entropy)
     probs = usage_counts.float() / usage_counts.sum()
-    probs = probs[probs > 0]  # filter zeros for log
+    probs = probs[probs > 0]
     entropy = -(probs * probs.log()).sum().item()
     perplexity = math.exp(entropy)
 
@@ -202,7 +199,6 @@ def compute_codebook_stats(model, val_loader, device):
 
 
 def print_codebook_stats(stats):
-    """Print codebook statistics in a readable format."""
     print(f"\n{'='*50}")
     print(f"Codebook Statistics")
     print(f"{'='*50}")
@@ -224,7 +220,6 @@ def print_codebook_stats(stats):
 
 
 def save_usage_histogram(stats, save_path):
-    """Save codebook usage histogram as an image."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -233,7 +228,6 @@ def save_usage_histogram(stats, save_path):
         counts = stats["usage_counts"]
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-        # Full histogram
         axes[0].bar(range(len(counts)), counts, width=1.0)
         axes[0].set_xlabel("Codebook Index")
         axes[0].set_ylabel("Usage Count")
@@ -242,7 +236,6 @@ def save_usage_histogram(stats, save_path):
             f"perplexity: {stats['perplexity']:.0f})"
         )
 
-        # Sorted histogram (easier to see distribution)
         sorted_counts = np.sort(counts)[::-1]
         axes[1].bar(range(len(sorted_counts)), sorted_counts, width=1.0)
         axes[1].set_xlabel("Rank")
@@ -296,6 +289,26 @@ def evaluate(args):
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
+    # --- W&B Logger ---
+    eval_config = load_eval_config(args.wandb_config)
+    wb = WandbLogger(
+        config={
+            "model": "VQ-VAE",
+            "mode": "evaluation",
+            "checkpoint": args.checkpoint,
+            "epoch": epoch,
+            **config,
+        },
+        run_name=args.run_name,
+        tags=["vqvae", "evaluation"],
+        enabled=not args.no_wandb,
+        metric_enabled_fn=eval_config.is_metric_enabled,
+    )
+    wb.log_architecture(model, "VQ-VAE", extra_metadata={
+        "latent_dim": config.get("latent_dim", 16),
+        "num_embeddings": config.get("num_embeddings", 1024),
+    })
+
     # 1. Reconstruction grid
     print("\nGenerating reconstruction grid...")
     grid, originals, reconstructions = make_reconstruction_grid(
@@ -304,6 +317,7 @@ def evaluate(args):
     grid_path = os.path.join(output_dir, "reconstruction_grid.png")
     save_image(grid, grid_path)
     print(f"Saved reconstruction grid to {grid_path}")
+    wb.log_image("Evaluation/Reconstruction Grid", grid_path)
 
     # 2. Full-resolution output
     if args.full_res:
@@ -313,13 +327,82 @@ def evaluate(args):
             model, val_loader, device, full_res_dir, num_images=args.num_images
         )
 
-    # 3. Codebook statistics
+    # 3. Single-frame metrics (averaged over validation set)
+    print("\nComputing single-frame metrics...")
+    all_frame_metrics = {}
+    num_batches = 0
+    real_images_np = []
+    fake_images_np = []
+
+    for batch in tqdm(val_loader, desc="Single-frame metrics"):
+        x = batch.to(device)
+        with torch.no_grad():
+            x_recon, _, _, _ = model(x)
+
+        frame_metrics = evaluate_single_frame(x_recon, x, compute_components=True)
+        for k, v in frame_metrics.items():
+            all_frame_metrics[k] = all_frame_metrics.get(k, 0.0) + v
+        num_batches += 1
+
+        if args.heavy_metrics:
+            real_np = ((x + 1) * 127.5).clamp(0, 255).byte().cpu().permute(0, 2, 3, 1).numpy()
+            fake_np = ((x_recon + 1) * 127.5).clamp(0, 255).byte().cpu().permute(0, 2, 3, 1).numpy()
+            for i in range(real_np.shape[0]):
+                real_images_np.append(real_np[i])
+                fake_images_np.append(fake_np[i])
+
+    avg_frame_metrics = {k: v / num_batches for k, v in all_frame_metrics.items()}
+    print(f"\nSingle-frame metrics (avg over val set):")
+    for k, v in avg_frame_metrics.items():
+        print(f"  {k}: {v:.4f}")
+    wandb_frame = {f"Evaluation/{k}": v for k, v in avg_frame_metrics.items()}
+    wb.log(wandb_frame)
+
+    # 4. Codebook statistics
     print("\nComputing codebook statistics...")
-    stats = compute_codebook_stats(model, val_loader, device)
+    stats = compute_codebook_stats_full(model, val_loader, device)
     print_codebook_stats(stats)
+    wb.log({
+        M.codebook_perplexity(): stats["perplexity"],
+        M.codebook_utilization(): stats["utilization"],
+    })
 
     hist_path = os.path.join(output_dir, "codebook_usage.png")
     save_usage_histogram(stats, hist_path)
+    wb.log_image("Evaluation/Codebook Usage Histogram", hist_path)
+
+    # 5. FID / KID
+    if args.heavy_metrics and len(real_images_np) > 0:
+        print("\nComputing FID / KID...")
+        num_samples = min(len(real_images_np), eval_config.metric_num_samples("fid"))
+        fid_min_samples = eval_config.metric_min_samples("fid", default=1)
+        kid_min_samples = eval_config.metric_min_samples("kid", default=1)
+
+        real_fid = _repeat_to_min_samples(real_images_np[:num_samples], fid_min_samples)
+        fake_fid = _repeat_to_min_samples(fake_images_np[:num_samples], fid_min_samples)
+        try:
+            fid_val = compute_fid(real_fid, fake_fid)
+            print(f"  FID: {fid_val:.2f}")
+            wb.log({M.fid(): fid_val})
+        except ImportError as e:
+            print(f"  FID skipped: {e}")
+        except Exception as e:
+            print(f"  FID skipped (tiny-sample backend error): {e}")
+
+        try:
+            real_kid = _repeat_to_min_samples(real_images_np[:num_samples], kid_min_samples)
+            fake_kid = _repeat_to_min_samples(fake_images_np[:num_samples], kid_min_samples)
+            kid_val = compute_kid(real_kid, fake_kid)
+            print(f"  KID: {kid_val:.4f}")
+            wb.log({M.kid(): kid_val})
+        except ImportError as e:
+            print(f"  KID skipped: {e}")
+        except Exception as e:
+            print(f"  KID skipped (tiny-sample backend error): {e}")
+
+    wb.log_summary(avg_frame_metrics)
+    wb.finish()
+    print("\nEvaluation complete.")
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +427,16 @@ def parse_args():
                         help="DataLoader num_workers")
     parser.add_argument("--full_res", action="store_true",
                         help="Also generate full-resolution 840x420 outputs")
+    parser.add_argument("--heavy_metrics", action="store_true",
+                        help="Compute heavy metrics (FID, KID)")
+
+    # W&B
+    parser.add_argument("--wandb_config", type=str, default="wandb_config.json",
+                        help="Path to wandb/eval config JSON")
+    parser.add_argument("--run_name", type=str, default=None,
+                        help="W&B run name override")
+    parser.add_argument("--no_wandb", action="store_true",
+                        help="Disable W&B logging")
 
     return parser.parse_args()
 

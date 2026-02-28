@@ -8,7 +8,7 @@ Usage:
 
 Hyperparameters:
     Optimizer:  AdamW, lr=3e-4, betas=(0.9, 0.95), weight_decay=1e-4
-    Scheduler:  Linear warmup 1000 steps, then cosine decay to 1e-5
+    Scheduler:  Linear warmup 10 epochs, then cosine decay to 1e-5
     Batch size: 64
     Epochs:     100 (early stopping, patience=15)
     Mixed prec: FP16 autocast + GradScaler
@@ -20,7 +20,6 @@ Hyperparameters:
 import argparse
 import os
 import time
-import math
 import warnings
 
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
@@ -29,12 +28,18 @@ warnings.filterwarnings('ignore', category=UserWarning)
 
 import torch
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from dynamics.model import DynamicsUNet
 from dynamics.dataset import create_dataloaders
 from dynamics.inference import predict_next_frame
+
+from evaluation.config import load_eval_config
+from evaluation.orchestrator import EvalOrchestrator
+from logger.wandb_logger import WandbLogger
+from logger.metric_names import M
+from logger.gradient_stats import compute_gradient_stats
+from logger.architecture import serialize_model_architecture
 
 
 # ---------------------------------------------------------------------------
@@ -80,15 +85,6 @@ def get_ss_probability(epoch, total_epochs, ss_start_epoch, ss_max_prob=0.5):
     Scheduled sampling probability schedule.
     
     Linear ramp from 0 to ss_max_prob starting at ss_start_epoch.
-    
-    Args:
-        epoch: Current epoch
-        total_epochs: Total training epochs
-        ss_start_epoch: Epoch to start scheduled sampling
-        ss_max_prob: Maximum scheduled sampling probability
-    
-    Returns:
-        Probability of using model predictions instead of ground truth
     """
     if epoch < ss_start_epoch:
         return 0.0
@@ -96,24 +92,45 @@ def get_ss_probability(epoch, total_epochs, ss_start_epoch, ss_max_prob=0.5):
     return min(progress * ss_max_prob, ss_max_prob)
 
 
-def get_lr_lambda(warmup_steps, total_steps, min_lr, max_lr):
+def build_scheduler(optimizer, warmup_epochs, total_epochs, steps_per_epoch, min_lr):
     """
-    Returns a lambda for torch.optim.lr_scheduler.LambdaLR.
-    
-    - Linear warmup from 0 to max_lr over `warmup_steps`.
-    - Cosine decay from max_lr to min_lr over remaining steps.
+    Build a built-in scheduler chain: Linear warmup -> Cosine annealing.
     """
-    def lr_lambda(step):
-        if step < warmup_steps:
-            # Linear warmup
-            return step / max(warmup_steps, 1)
-        else:
-            # Cosine decay
-            progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-            progress = min(progress, 1.0)
-            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return (min_lr / max_lr) + (1.0 - min_lr / max_lr) * cosine
-    return lr_lambda
+    steps_per_epoch = max(int(steps_per_epoch), 1)
+    total_steps = max(int(total_epochs) * steps_per_epoch, 1)
+    warmup_steps = max(0, int(warmup_epochs) * steps_per_epoch)
+
+    if warmup_steps <= 0:
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=total_steps,
+            eta_min=min_lr,
+        )
+
+    if warmup_steps >= total_steps:
+        return torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1e-6,
+            end_factor=1.0,
+            total_iters=total_steps,
+        )
+
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=1e-6,
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps - warmup_steps,
+        eta_min=min_lr,
+    )
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[warmup_steps],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -124,53 +141,30 @@ def get_lr_lambda(warmup_steps, total_steps, min_lr, max_lr):
 def training_step(model, context_zq, target_zq, action, diffusion_forcing=True, max_context_noise=0.2):
     """
     Flow matching training step with optional diffusion forcing.
-    
-    Args:
-        model: DynamicsUNet
-        context_zq: [B, ctx_len, 16, 32, 32] context frames
-        target_zq: [B, 16, 32, 32] target frame
-        action: [B] int action
-        diffusion_forcing: whether to corrupt context frames
-        max_context_noise: maximum noise level for diffusion forcing
-    
-    Returns:
-        loss: scalar MSE loss on velocity
     """
     B = target_zq.shape[0]
     device = target_zq.device
     
-    # --- Diffusion Forcing: optionally corrupt context frames ---
     if diffusion_forcing and model.training:
-        # With 50% probability, add noise to context frames
         if torch.rand(1).item() < 0.5:
-            # Sample independent noise level per context frame per batch item
-            # noise_level in [0, max_context_noise], shape [B, ctx_len, 1, 1, 1]
             noise_levels = torch.rand(B, context_zq.shape[1], 1, 1, 1, device=device) * max_context_noise
             noise = torch.randn_like(context_zq)
             context_zq = (1 - noise_levels) * context_zq + noise_levels * noise
     
-    # Flatten context: [B, ctx_len, 16, 32, 32] -> [B, ctx_len*16, 32, 32]
     context_flat = context_zq.reshape(B, -1, 32, 32)
     
-    # --- Flow Matching ---
-    # Sample noise (source distribution)
-    x_0 = torch.randn_like(target_zq)  # [B, 16, 32, 32]
-    x_1 = target_zq                     # [B, 16, 32, 32] (target)
+    x_0 = torch.randn_like(target_zq)
+    x_1 = target_zq
     
-    # Sample flow time
-    t = torch.rand(B, device=device)    # [B]
+    t = torch.rand(B, device=device)
     
-    # Interpolate along OT path
-    t_expand = t[:, None, None, None]   # [B, 1, 1, 1]
-    x_t = (1 - t_expand) * x_0 + t_expand * x_1   # [B, 16, 32, 32]
+    t_expand = t[:, None, None, None]
+    x_t = (1 - t_expand) * x_0 + t_expand * x_1
     
-    # Target velocity
-    u_t = x_1 - x_0   # [B, 16, 32, 32]
+    u_t = x_1 - x_0
     
-    # Model prediction
-    v_pred = model(x_t, t, context_flat, action)   # [B, 16, 32, 32]
+    v_pred = model(x_t, t, context_flat, action)
     
-    # MSE loss on velocity
     loss = F.mse_loss(v_pred, u_t)
     
     return loss
@@ -188,36 +182,15 @@ def rollout_training_step(
 ):
     """
     Multi-step rollout training with scheduled sampling.
-    
-    Trains the model on its own predictions to learn error recovery and prevent
-    autoregressive drift. The model generates predictions and uses them as context
-    for subsequent steps, with probability p_ss.
-    
-    Args:
-        model: DynamicsUNet
-        context_zq: [B, ctx_len, 16, 32, 32] initial context frames
-        targets_zq: [B, rollout_len, 16, 32, 32] ground truth target frames
-        actions: [B, rollout_len] actions for each transition
-        p_ss: scheduled sampling probability (use model prediction vs ground truth)
-        rollout_mode: "full_ode" (accurate, expensive) or "fast" (approximate, cheaper)
-        rollout_ode_steps: number of ODE steps for generating predictions
-        codebook: [K, C] VQ-VAE codebook for quantizing predictions
-        diffusion_forcing: whether to corrupt context frames
-        max_context_noise: maximum noise level for diffusion forcing
-    
-    Returns:
-        loss: scalar averaged over all rollout steps
     """
     B, rollout_length = actions.shape
     device = targets_zq.device
     
-    # Start with ground truth context
-    current_context = context_zq.clone()  # [B, ctx_len, 16, 32, 32]
+    current_context = context_zq.clone()
     
     total_loss = 0.0
     
     for step in range(rollout_length):
-        # --- Diffusion Forcing: optionally corrupt context frames ---
         if diffusion_forcing and model.training:
             if torch.rand(1).item() < 0.5:
                 noise_levels = torch.rand(B, current_context.shape[1], 1, 1, 1, device=device) * max_context_noise
@@ -228,53 +201,39 @@ def rollout_training_step(
         else:
             step_context = current_context
         
-        # Flatten context: [B, ctx_len, 16, 32, 32] -> [B, ctx_len*16, 32, 32]
         context_flat = step_context.reshape(B, -1, 32, 32)
         
-        # Get current target and action
-        target_zq = targets_zq[:, step]  # [B, 16, 32, 32]
-        action = actions[:, step]  # [B]
+        target_zq = targets_zq[:, step]
+        action = actions[:, step]
         
-        # --- Flow Matching Loss ---
-        # Sample noise (source distribution)
-        x_0 = torch.randn_like(target_zq)  # [B, 16, 32, 32]
-        x_1 = target_zq  # [B, 16, 32, 32] (target)
+        x_0 = torch.randn_like(target_zq)
+        x_1 = target_zq
         
-        # Sample flow time
-        t = torch.rand(B, device=device)  # [B]
+        t = torch.rand(B, device=device)
         
-        # Interpolate along OT path
-        t_expand = t[:, None, None, None]  # [B, 1, 1, 1]
-        x_t = (1 - t_expand) * x_0 + t_expand * x_1  # [B, 16, 32, 32]
+        t_expand = t[:, None, None, None]
+        x_t = (1 - t_expand) * x_0 + t_expand * x_1
         
-        # Target velocity
-        u_t = x_1 - x_0  # [B, 16, 32, 32]
+        u_t = x_1 - x_0
         
-        # Model prediction
-        v_pred = model(x_t, t, context_flat, action)  # [B, 16, 32, 32]
+        v_pred = model(x_t, t, context_flat, action)
         
-        # MSE loss on velocity
         step_loss = F.mse_loss(v_pred, u_t)
         total_loss += step_loss
         
-        # --- Generate prediction for next context (no grad) ---
-        if step < rollout_length - 1:  # Only if there are more steps
+        if step < rollout_length - 1:
             with torch.no_grad():
-                # Start from noise
                 x = torch.randn_like(target_zq)
                 
-                # Choose ODE integration method
                 dt = 1.0 / rollout_ode_steps
                 
                 if rollout_mode == "fast":
-                    # Fast mode: fewer ODE steps (2-3)
                     for i in range(rollout_ode_steps):
                         t_ode = torch.full((B,), i * dt, device=device)
                         v = model(x, t_ode, context_flat, action)
                         x = x + v * dt
                 
                 elif rollout_mode == "full_ode":
-                    # Full ODE mode: standard number of steps (10-20)
                     for i in range(rollout_ode_steps):
                         t_ode = torch.full((B,), i * dt, device=device)
                         v = model(x, t_ode, context_flat, action)
@@ -283,30 +242,25 @@ def rollout_training_step(
                 else:
                     raise ValueError(f"Unknown rollout_mode: {rollout_mode}")
                 
-                # Quantize prediction through codebook
                 if codebook is not None:
                     from dynamics.inference import quantize_latent
                     x = quantize_latent(x, codebook)
                 
-                predicted_frame = x  # [B, 16, 32, 32]
+                predicted_frame = x
             
-            # Scheduled sampling: decide whether to use prediction or ground truth
-            use_prediction = torch.rand(B, device=device) < p_ss  # [B] bool
+            use_prediction = torch.rand(B, device=device) < p_ss
             
-            # Prepare next frame for each batch item
             next_frame = torch.where(
-                use_prediction[:, None, None, None],  # [B, 1, 1, 1]
-                predicted_frame,  # [B, 16, 32, 32]
-                targets_zq[:, step]  # [B, 16, 32, 32] (ground truth)
+                use_prediction[:, None, None, None],
+                predicted_frame,
+                targets_zq[:, step]
             )
             
-            # Update context: shift window (drop oldest, append newest)
             current_context = torch.cat([
-                current_context[:, 1:],  # [B, ctx_len-1, 16, 32, 32]
-                next_frame.unsqueeze(1)  # [B, 1, 16, 32, 32]
-            ], dim=1)  # [B, ctx_len, 16, 32, 32]
+                current_context[:, 1:],
+                next_frame.unsqueeze(1)
+            ], dim=1)
     
-    # Average loss over all steps
     avg_loss = total_loss / rollout_length
     
     return avg_loss
@@ -322,8 +276,6 @@ def validate(model, val_loader, device, rollout_length=1, rollout_mode="fast",
              rollout_ode_steps=3, codebook=None, diffusion_forcing=True, max_context_noise=0.2):
     """
     Run validation and return average loss.
-    
-    Handles both single-step (rollout_length=1) and multi-step validation.
     """
     model.eval()
     total_loss = 0.0
@@ -336,17 +288,13 @@ def validate(model, val_loader, device, rollout_length=1, rollout_mode="fast",
         actions = actions.to(device)
         
         if rollout_length == 1:
-            # Single-step validation
-            # targets_zq is [B, 1, 16, 32, 32], squeeze to [B, 16, 32, 32]
-            # actions is [B, 1], squeeze to [B]
             target_zq = targets_zq[:, 0] if targets_zq.dim() == 5 else targets_zq
             action = actions[:, 0] if actions.dim() == 2 else actions
             loss = training_step(model, context_zq, target_zq, action, diffusion_forcing, max_context_noise)
         else:
-            # Multi-step validation (always use p_ss=0 for validation - pure teacher forcing)
             loss = rollout_training_step(
                 model, context_zq, targets_zq, actions,
-                p_ss=0.0,  # No scheduled sampling during validation
+                p_ss=0.0,
                 rollout_mode=rollout_mode,
                 rollout_ode_steps=rollout_ode_steps,
                 codebook=codebook,
@@ -384,9 +332,9 @@ def train(args):
         batch_size=args.batch_size,
         val_split=0.1,
         num_workers=args.num_workers,
+        max_samples=args.max_samples,
     )
     
-    # Move codebook to device for rollout training
     codebook = codebook.to(device)
     
     steps_per_epoch = len(train_loader)
@@ -396,7 +344,7 @@ def train(args):
     
     # Model
     model = DynamicsUNet(
-        in_channels=16 + 16 * args.context_length,  # noisy target + context
+        in_channels=16 + 16 * args.context_length,
         out_channels=16,
         base_channels=args.base_channels,
         channel_mults=tuple(args.channel_mults),
@@ -417,14 +365,19 @@ def train(args):
         weight_decay=args.weight_decay,
     )
     
+    if args.warmup_epochs > args.epochs:
+        raise ValueError(
+            f"warmup_epochs ({args.warmup_epochs}) cannot be greater than epochs ({args.epochs})"
+        )
+
     # Scheduler
-    lr_lambda = get_lr_lambda(
-        warmup_steps=args.warmup_steps,
-        total_steps=total_steps,
+    scheduler = build_scheduler(
+        optimizer=optimizer,
+        warmup_epochs=args.warmup_epochs,
+        total_epochs=args.epochs,
+        steps_per_epoch=steps_per_epoch,
         min_lr=args.min_lr,
-        max_lr=args.lr,
     )
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
     # EMA
     ema = EMA(model, decay=args.ema_decay)
@@ -433,13 +386,70 @@ def train(args):
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
     if device.type == "cuda":
         print(f"Mixed precision (FP16) enabled")
-    
-    # Tensorboard
-    writer = SummaryWriter(log_dir=args.log_dir)
-    
+
+    # --- W&B Logger ---
+    eval_config = load_eval_config(args.wandb_config)
+    run_config = {
+        "model": "Dynamics UNet",
+        "context_length": args.context_length,
+        "base_channels": args.base_channels,
+        "channel_mults": args.channel_mults,
+        "cond_dim": args.cond_dim,
+        "num_actions": args.num_actions,
+        "attn_resolution": args.attn_resolution,
+        "lr": args.lr,
+        "min_lr": args.min_lr,
+        "batch_size": args.batch_size,
+        "max_samples": args.max_samples,
+        "epochs": args.epochs,
+        "weight_decay": args.weight_decay,
+        "warmup_epochs": args.warmup_epochs,
+        "patience": args.patience,
+        "diffusion_forcing": args.diffusion_forcing,
+        "max_context_noise": args.max_context_noise,
+        "rollout_length": args.rollout_length,
+        "rollout_mode": args.rollout_mode,
+        "rollout_ode_steps": args.rollout_ode_steps,
+        "ss_start_epoch": args.ss_start_epoch,
+        "ss_max_prob": args.ss_max_prob,
+        "ema_decay": args.ema_decay,
+        "eval_config": eval_config.raw,
+    }
+    wb = WandbLogger(
+        config=run_config,
+        run_name=args.run_name,
+        group="Dynamics",
+        tags=["dynamics", "training"],
+        enabled=not args.no_wandb,
+        metric_enabled_fn=eval_config.is_metric_enabled,
+    )
+
+    wb.log_architecture(model, "Dynamics UNet", extra_metadata={
+        "in_channels": 16 + 16 * args.context_length,
+        "out_channels": 16,
+        "spatial_path": "32x32 -> 16x16 -> 8x8 -> 16x16 -> 32x32",
+        "num_actions": args.num_actions,
+    })
+
+    # Load VQ-VAE for eval orchestrator (if checkpoint exists)
+    vqvae_model = None
+    if os.path.exists(args.vqvae_checkpoint):
+        from vqvae.model import VQVAE
+        vqvae_ckpt = torch.load(args.vqvae_checkpoint, map_location=device, weights_only=False)
+        vqvae_cfg = vqvae_ckpt.get("config", {})
+        vqvae_model = VQVAE(
+            latent_dim=vqvae_cfg.get("latent_dim", 16),
+            num_embeddings=vqvae_cfg.get("num_embeddings", 1024),
+            commitment_cost=vqvae_cfg.get("commitment_cost", 0.25),
+            ema_decay=vqvae_cfg.get("ema_decay", 0.99),
+        ).to(device)
+        vqvae_model.load_state_dict(vqvae_ckpt["model_state_dict"])
+        vqvae_model.eval()
+
+    orchestrator = EvalOrchestrator(eval_config, wb, device)
+
     # Checkpointing
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    os.makedirs(args.log_dir, exist_ok=True)
     
     # Resume from checkpoint
     start_epoch = 0
@@ -458,7 +468,11 @@ def train(args):
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         global_step = ckpt.get("global_step", start_epoch * steps_per_epoch)
         print(f"Resumed at epoch {start_epoch}, global_step {global_step}")
-    
+
+    # Gradient stats config (epoch-based logging)
+    grad_enabled = eval_config.gradient_stats_enabled
+    grad_modules = eval_config.gradient_modules("dynamics")
+
     # --------------- Training Loop ---------------
     print(f"\n{'='*60}")
     print(f"Training Dynamics Model for {args.epochs} epochs")
@@ -468,6 +482,10 @@ def train(args):
         model.train()
         epoch_loss = 0.0
         epoch_start = time.time()
+        epoch_step = epoch + 1
+        epoch_ss_prob = get_ss_probability(
+            epoch, args.epochs, args.ss_start_epoch, args.ss_max_prob
+        ) if args.rollout_length > 1 else 0.0
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
         for batch_idx, (context_zq, targets_zq, actions) in enumerate(pbar):
@@ -475,12 +493,8 @@ def train(args):
             targets_zq = targets_zq.to(device, non_blocking=True)
             actions = actions.to(device, non_blocking=True)
             
-            # Forward pass with mixed precision
             with torch.amp.autocast("cuda", dtype=torch.float16, enabled=(device.type == "cuda")):
                 if args.rollout_length == 1:
-                    # Single-step training (backward compatible)
-                    # targets_zq is [B, 1, 16, 32, 32], squeeze to [B, 16, 32, 32]
-                    # actions is [B, 1], squeeze to [B]
                     target_zq = targets_zq[:, 0]
                     action = actions[:, 0]
                     loss = training_step(
@@ -489,11 +503,9 @@ def train(args):
                         max_context_noise=args.max_context_noise
                     )
                 else:
-                    # Multi-step rollout training with scheduled sampling
-                    p_ss = get_ss_probability(epoch, args.epochs, args.ss_start_epoch, args.ss_max_prob)
                     loss = rollout_training_step(
                         model, context_zq, targets_zq, actions,
-                        p_ss=p_ss,
+                        p_ss=epoch_ss_prob,
                         rollout_mode=args.rollout_mode,
                         rollout_ode_steps=args.rollout_ode_steps,
                         codebook=codebook,
@@ -506,6 +518,7 @@ def train(args):
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -516,17 +529,9 @@ def train(args):
             global_step += 1
             epoch_loss += loss.item()
             
-            # Log every N steps
-            if global_step % args.log_every == 0:
-                current_lr = optimizer.param_groups[0]["lr"]
-                writer.add_scalar("train/loss", loss.item(), global_step)
-                writer.add_scalar("train/lr", current_lr, global_step)
-                if args.rollout_length > 1:
-                    writer.add_scalar("train/ss_prob", p_ss, global_step)
-            
             # Update progress bar
             if args.rollout_length > 1:
-                pbar.set_postfix({"loss": f"{loss.item():.4f}", "ss_prob": f"{p_ss:.3f}"})
+                pbar.set_postfix({"loss": f"{loss.item():.4f}", "ss_prob": f"{epoch_ss_prob:.3f}"})
             else:
                 pbar.set_postfix({"loss": f"{loss.item():.4f}"})
         
@@ -534,6 +539,21 @@ def train(args):
         epoch_time = time.time() - epoch_start
         avg_epoch_loss = epoch_loss / max(len(train_loader), 1)
         print(f"\nEpoch {epoch+1} train (avg) | loss: {avg_epoch_loss:.4f} | time: {epoch_time:.1f}s")
+
+        # W&B train metrics (epoch-based step)
+        current_lr = optimizer.param_groups[0]["lr"]
+        train_log = {
+            M.train_loss("Velocity MSE"): avg_epoch_loss,
+            M.learning_rate(): current_lr,
+        }
+        if args.rollout_length > 1:
+            train_log[M.scheduled_sampling_prob()] = epoch_ss_prob
+        wb.log(train_log, step=epoch_step)
+
+        # Gradient stats are epoch-based to keep all metrics on the same axis.
+        if grad_enabled:
+            grad_stats = compute_gradient_stats(model, grad_modules)
+            wb.log(grad_stats, step=epoch_step)
         
         # --------------- Validation ---------------
         val_loss = validate(
@@ -547,8 +567,14 @@ def train(args):
         )
         print(f"Epoch {epoch+1} val   (avg) | loss: {val_loss:.4f}")
         
-        # Tensorboard val metrics
-        writer.add_scalar("val/loss", val_loss, global_step)
+        wb.log({M.val_loss("Velocity MSE"): val_loss}, step=epoch_step)
+
+        # --------------- Evaluation Orchestrator ---------------
+        if vqvae_model is not None:
+            orchestrator.run_dynamics_epoch_eval(
+                model, vqvae_model, val_loader,
+                epoch_step, epoch_step, codebook,
+            )
         
         # --------------- Checkpointing ---------------
         checkpoint = {
@@ -569,6 +595,7 @@ def train(args):
                 "attn_resolution": args.attn_resolution,
                 "lr": args.lr,
                 "batch_size": args.batch_size,
+                "max_samples": args.max_samples,
                 "epochs": args.epochs,
                 "diffusion_forcing": args.diffusion_forcing,
                 "max_context_noise": args.max_context_noise,
@@ -584,6 +611,8 @@ def train(args):
         # Save latest
         latest_path = os.path.join(args.checkpoint_dir, "dynamics_latest.pt")
         torch.save(checkpoint, latest_path)
+        if eval_config.log_latest_checkpoint:
+            wb.log_checkpoint(latest_path, "dynamics-latest", metadata={"epoch": epoch, "val_loss": val_loss})
         
         # Save best
         if val_loss < best_val_loss:
@@ -593,6 +622,8 @@ def train(args):
             checkpoint["best_val_loss"] = best_val_loss
             torch.save(checkpoint, best_path)
             print(f"New best model! val_loss={val_loss:.4f}")
+            if eval_config.log_best_checkpoint:
+                wb.log_checkpoint(best_path, "dynamics-best", metadata={"epoch": epoch, "val_loss": val_loss})
         else:
             patience_counter += 1
             print(f"No improvement ({patience_counter}/{args.patience})")
@@ -605,7 +636,8 @@ def train(args):
         
         print()
     
-    writer.close()
+    wb.log_summary({"best_val_loss": best_val_loss})
+    wb.finish()
     print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
     print(f"Best model saved to: {os.path.join(args.checkpoint_dir, 'dynamics_best.pt')}")
 
@@ -625,6 +657,8 @@ def parse_args():
                         help="Path to VQ-VAE checkpoint (to extract codebook)")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader num_workers")
+    parser.add_argument("--max_samples", type=int, default=None,
+                        help="Maximum number of samples to use (None = use all)")
     
     # Model
     parser.add_argument("--context_length", type=int, default=4,
@@ -651,8 +685,8 @@ def parse_args():
                         help="Minimum learning rate (end of cosine decay)")
     parser.add_argument("--weight_decay", type=float, default=1e-4,
                         help="AdamW weight decay")
-    parser.add_argument("--warmup_steps", type=int, default=1000,
-                        help="Linear warmup steps")
+    parser.add_argument("--warmup_epochs", type=int, default=10,
+                        help="Linear warmup epochs")
     parser.add_argument("--patience", type=int, default=15,
                         help="Early stopping patience (epochs)")
     parser.add_argument("--grad_clip", type=float, default=1.0,
@@ -682,11 +716,17 @@ def parse_args():
     
     # Logging
     parser.add_argument("--log_every", type=int, default=50,
-                        help="Log to tensorboard every N steps")
-    parser.add_argument("--log_dir", type=str, default="runs/dynamics",
-                        help="TensorBoard log directory")
+                        help="Log to W&B every N steps")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints",
                         help="Checkpoint save directory")
+    
+    # W&B
+    parser.add_argument("--wandb_config", type=str, default="wandb_config.json",
+                        help="Path to wandb/eval config JSON")
+    parser.add_argument("--run_name", type=str, default=None,
+                        help="W&B run name override")
+    parser.add_argument("--no_wandb", action="store_true",
+                        help="Disable W&B logging")
     
     # Resume
     parser.add_argument("--resume", type=str, default=None,

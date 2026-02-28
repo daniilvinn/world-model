@@ -128,6 +128,7 @@ def create_dataloaders(
     val_split=0.1,
     num_workers=4,
     seed=42,
+    max_samples=None,
 ):
     """
     Create train and validation DataLoaders.
@@ -141,6 +142,7 @@ def create_dataloaders(
         val_split: Fraction of data for validation
         num_workers: Number of DataLoader workers
         seed: Random seed for reproducible split
+        max_samples: Maximum number of samples to use (None = use all)
     
     Returns:
         (train_loader, val_loader, codebook)
@@ -173,11 +175,27 @@ def create_dataloaders(
         rollout_length=rollout_length,
         codebook=codebook,
     )
+
+    # Limit dataset size if requested
+    if max_samples is not None and max_samples < len(dataset):
+        print(f"Limiting dataset from {len(dataset)} to {max_samples} samples")
+        generator = torch.Generator().manual_seed(seed)
+        indices = torch.randperm(len(dataset), generator=generator)[:max_samples].tolist()
+        dataset = torch.utils.data.Subset(dataset, indices)
     
     # Split into train/val
     total = len(dataset)
     val_size = int(total * val_split)
     train_size = total - val_size
+
+    # Keep both splits non-empty for tiny smoke-test datasets.
+    if total >= 2:
+        if val_size == 0 and val_split > 0:
+            val_size = 1
+            train_size = total - val_size
+        elif train_size == 0 and val_size > 0:
+            train_size = 1
+            val_size = total - train_size
     
     generator = torch.Generator().manual_seed(seed)
     train_dataset, val_dataset = random_split(
@@ -187,6 +205,8 @@ def create_dataloaders(
     print(f"Split: {train_size} train, {val_size} val")
     
     # Create dataloaders
+    # Avoid empty train loader when train split is smaller than batch size.
+    train_drop_last = train_size >= batch_size
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -194,7 +214,7 @@ def create_dataloaders(
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=num_workers > 0,
-        drop_last=True,
+        drop_last=train_drop_last,
     )
     
     val_loader = DataLoader(

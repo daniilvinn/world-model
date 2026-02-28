@@ -213,3 +213,4 @@ dataset/
 latents/
 checkpoints/
 eval_output/
+wandb/

@@ -1,0 +1,76 @@
+{
+    "metrics_gather_frequency": 5,
+    "metric_overrides": {
+        "fid": {
+            "frequency": 5,
+            "num_samples": 5000,
+            "min_samples": 2
+        },
+        "kid": {
+            "frequency": 5,
+            "num_samples": 5000,
+            "min_samples": 2
+        },
+        "fvd": {
+            "frequency": 10,
+            "num_samples": 1000
+        },
+        "optical_flow": {
+            "frequency": 0
+        },
+        "action_metrics": {
+            "frequency": 5
+        },
+        "failure_metrics": {
+            "frequency": 5
+        }
+    },
+    "metric_logging": {
+        "default_enabled": true,
+        "prefix_overrides": {
+            "Optimization/": true,
+            "Inference/": true,
+            "Evaluation/": true,
+            "Runtime/": true
+        },
+        "overrides": {
+            "Optimization/Train Loss (Total)": true,
+            "Optimization/Train Loss (L1 Reconstruction)": true,
+            "Optimization/Train Loss (LPIPS)": true,
+            "Optimization/Train Loss (Commitment)": true,
+            "Optimization/Train Loss (Velocity MSE)": true,
+            "Optimization/Val Loss (Total)": true,
+            "Optimization/Val Loss (L1 Reconstruction)": true,
+            "Optimization/Val Loss (LPIPS)": true,
+            "Optimization/Val Loss (Commitment)": true,
+            "Optimization/Val Loss (Velocity MSE)": true,
+            "Optimization/Learning Rate": true,
+            "Optimization/Codebook Usage (Train)": true,
+            "Optimization/Codebook Usage (Val)": true,
+            "Optimization/Scheduled Sampling Probability": true,
+            "Evaluation/Reconstruction Grid": true
+        }
+    },
+    "rollout": {
+        "short_horizons": [1, 4, 8, 16, 32, 64],
+        "long_horizons": [64, 128, 192, 256, 512],
+        "fvd_clip_lengths": [16, 32, 64, 128, 256, 512]
+    },
+    "gradient_stats": {
+        "enabled": true,
+        "frequency": 50,
+        "modules": {
+            "vqvae": ["encoder", "decoder", "quantizer"],
+            "dynamics": ["cond_net", "encoder_blocks", "mid_block1", "mid_block2", "decoder_blocks"]
+        }
+    },
+    "runtime_profiling": {
+        "enabled": true,
+        "frequency": 1
+    },
+    "artifacts": {
+        "checkpoint_frequency": 1,
+        "log_best": false,
+        "log_latest": false
+    }
+}
