@@ -323,7 +323,7 @@ def train(args):
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     
-    # Data
+    # Data (training loader)
     train_loader, val_loader, codebook = create_dataloaders(
         latents_dir=args.latents_dir,
         vqvae_checkpoint=args.vqvae_checkpoint,
@@ -430,6 +430,31 @@ def train(args):
         "spatial_path": "32x32 -> 16x16 -> 8x8 -> 16x16 -> 32x32",
         "num_actions": args.num_actions,
     })
+
+    # Build a dedicated validation loader for evaluation metrics so rollout
+    # metrics/FVD can cover configured horizons even when training rollout is short.
+    eval_rollout_length = args.rollout_length
+    if eval_config.short_horizons:
+        eval_rollout_length = max(eval_rollout_length, max(eval_config.short_horizons))
+    if eval_config.fvd_clip_lengths:
+        eval_rollout_length = max(eval_rollout_length, max(eval_config.fvd_clip_lengths))
+
+    eval_val_loader = val_loader
+    if eval_rollout_length > args.rollout_length:
+        print(
+            f"Building eval validation loader with rollout_length={eval_rollout_length} "
+            f"(train rollout_length={args.rollout_length})"
+        )
+        _, eval_val_loader, _ = create_dataloaders(
+            latents_dir=args.latents_dir,
+            vqvae_checkpoint=args.vqvae_checkpoint,
+            context_length=args.context_length,
+            rollout_length=eval_rollout_length,
+            batch_size=args.batch_size,
+            val_split=0.1,
+            num_workers=args.num_workers,
+            max_samples=args.max_samples,
+        )
 
     # Load VQ-VAE for eval orchestrator (if checkpoint exists)
     vqvae_model = None
@@ -572,7 +597,7 @@ def train(args):
         # --------------- Evaluation Orchestrator ---------------
         if vqvae_model is not None:
             orchestrator.run_dynamics_epoch_eval(
-                model, vqvae_model, val_loader,
+                model, vqvae_model, eval_val_loader,
                 epoch_step, epoch_step, codebook,
             )
         

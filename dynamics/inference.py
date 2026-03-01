@@ -170,15 +170,15 @@ def predict_next_frame(
     if solver == "euler":
         # Euler method (1st-order)
         for i in range(num_steps):
-            t = torch.tensor([i * dt], device=device)
+            t = torch.full((B,), i * dt, device=device)
             v = model(x, t, context_flat, action_tensor)
             x = x + v * dt
     
     elif solver == "midpoint":
         # Midpoint method (2nd-order, better accuracy, 2x NFE)
         for i in range(num_steps):
-            t = torch.tensor([i * dt], device=device)
-            t_mid = torch.tensor([i * dt + 0.5 * dt], device=device)
+            t = torch.full((B,), i * dt, device=device)
+            t_mid = torch.full((B,), i * dt + 0.5 * dt, device=device)
             
             # First velocity at current point
             v1 = model(x, t, context_flat, action_tensor)

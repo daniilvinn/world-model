@@ -19,9 +19,7 @@ chardet<6
 # Evaluation metrics
 scipy>=1.10.0
 Pillow>=9.0.0
-
-# Optional: FID/KID computation (heavy metrics)
-# torch-fidelity>=0.3.0
+torch-fidelity>=0.3.0
 
 # Optional: Optical flow (temporal metrics)
 # opencv-python>=4.8.0

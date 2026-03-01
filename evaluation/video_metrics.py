@@ -36,8 +36,10 @@ def compute_fvd(
     """
     from evaluation._fvd_i3d import get_fvd_features, frechet_distance
 
-    real_feats = get_fvd_features(real_videos.to(device))
-    fake_feats = get_fvd_features(fake_videos.to(device))
+    # Keep video tensors on CPU and let feature extraction stream clips
+    # to the compute device one-by-one to avoid large GPU spikes.
+    real_feats = get_fvd_features(real_videos, device=device)
+    fake_feats = get_fvd_features(fake_videos, device=device)
 
     return frechet_distance(real_feats, fake_feats)
 

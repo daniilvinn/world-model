@@ -12,7 +12,7 @@
             "min_samples": 2
         },
         "fvd": {
-            "frequency": 10,
+            "frequency": 5,
             "num_samples": 1000
         },
         "optical_flow": {
@@ -29,7 +29,8 @@
         "default_enabled": true,
         "prefix_overrides": {
             "Optimization/": true,
-            "Inference/": true,
+            "Gradients/": true,
+            "Validation/": true,
             "Evaluation/": true,
             "Runtime/": true
         },
@@ -52,9 +53,9 @@
         }
     },
     "rollout": {
-        "short_horizons": [1, 4, 8, 16, 32, 64],
-        "long_horizons": [64, 128, 192, 256, 512],
-        "fvd_clip_lengths": [16, 32, 64, 128, 256, 512]
+        "short_horizons": [8],
+        "long_horizons": [128],
+        "fvd_clip_lengths": [16, 64, 512]
     },
     "gradient_stats": {
         "enabled": true,

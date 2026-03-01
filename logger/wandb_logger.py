@@ -236,11 +236,12 @@ class WandbLogger:
         model: nn.Module,
         step: int,
         module_names: Optional[List[str]] = None,
+        model_name: Optional[str] = None,
     ) -> None:
         """Compute and log gradient norm/mean/std/max (global + per-module)."""
         if not self.enabled:
             return
-        stats = compute_gradient_stats(model, module_names)
+        stats = compute_gradient_stats(model, module_names, model_name=model_name)
         if stats:
             self.log(stats, step=step)
 

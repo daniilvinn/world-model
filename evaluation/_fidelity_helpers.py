@@ -65,12 +65,23 @@ def kid_from_arrays(
             "Install it with: pip install torch-fidelity"
         )
 
+    n = min(len(real), len(fake))
+    if n < 2:
+        raise ValueError("KID requires at least 2 samples per set.")
+
+    # torch-fidelity defaults (subset_size=1000, subsets=100) are too large
+    # for smoke runs. Adapt to available sample count to keep KID computable.
+    subset_size = min(1000, n)
+    num_subsets = max(1, min(10, n // 2))
+
     metrics = torch_fidelity.calculate_metrics(
         input1=_NumpyImageDataset(fake),
         input2=_NumpyImageDataset(real),
         cuda=torch.cuda.is_available(),
         fid=False,
         kid=True,
+        kid_subset_size=subset_size,
+        kid_subsets=num_subsets,
         verbose=False,
     )
     return float(metrics["kernel_inception_distance_mean"])

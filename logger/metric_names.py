@@ -2,7 +2,7 @@
 Central metric-name registry for W&B logging.
 
 Every logged metric MUST go through this module so that:
-  - Folder structure (Optimization / Inference / Evaluation / Runtime) is consistent.
+  - Folder structure (Optimization / Gradients / Validation / Evaluation / Runtime) is consistent.
   - Plot titles are human-readable (e.g. "Loss (LPIPS)", not "lpips_loss").
   - Parametric names (horizons, clip lengths) are formatted uniformly.
 
@@ -18,7 +18,8 @@ Usage::
 
 class Namespace:
     OPTIMIZATION = "Optimization"
-    INFERENCE = "Inference"
+    GRADIENTS = "Gradients"
+    VALIDATION = "Validation"
     EVALUATION = "Evaluation"
     RUNTIME = "Runtime"
 
@@ -51,37 +52,41 @@ class M:
     # ----- Gradient statistics ----------------------------------------------
 
     @staticmethod
-    def gradient(stat: str, scope: str) -> str:
-        """``stat`` in {Norm, Mean, Std, Max}; ``scope`` e.g. 'Global', 'Encoder'."""
-        return f"{Namespace.OPTIMIZATION}/Gradient {stat} ({scope})"
+    def gradient(stat: str, scope: str, model: str | None = None) -> str:
+        """
+        ``stat`` in {Norm, Mean, Std, Max}; ``scope`` e.g. 'Global', 'Encoder'.
+        ``model`` is accepted for backward-call compatibility but ignored:
+        gradients are run-scoped and always grouped under ``Gradients/...``.
+        """
+        return f"{Namespace.GRADIENTS}/Gradient {stat} ({scope})"
 
-    # ----- Inference (single-step & rollout) --------------------------------
+    # ----- Validation (single-step & rollout) -------------------------------
 
     @staticmethod
     def one_step(metric: str) -> str:
-        return f"{Namespace.INFERENCE}/One-Step {metric}"
+        return f"{Namespace.VALIDATION}/One-Step {metric}"
 
     @staticmethod
     def inference_at(metric: str, h: int) -> str:
-        return f"{Namespace.INFERENCE}/{metric} @ {h}"
+        return f"{Namespace.VALIDATION}/Rollout {metric} @ {h}"
 
     @staticmethod
     def inference_mean(metric: str, H: int) -> str:
-        return f"{Namespace.INFERENCE}/Mean {metric} (1-{H})"
+        return f"{Namespace.VALIDATION}/Rollout Mean {metric} (1-{H})"
 
     @staticmethod
     def token_entropy_at(h: int) -> str:
-        return f"{Namespace.INFERENCE}/Token Entropy @ {h}"
+        return f"{Namespace.VALIDATION}/Token Entropy @ {h}"
 
     @staticmethod
     def codebook_perplexity_at(h: int) -> str:
-        return f"{Namespace.INFERENCE}/Codebook Perplexity @ {h}"
+        return f"{Namespace.VALIDATION}/Codebook Perplexity @ {h}"
 
     @staticmethod
     def nll_over(H: int) -> str:
-        return f"{Namespace.INFERENCE}/NLL (1-{H})"
+        return f"{Namespace.VALIDATION}/NLL (1-{H})"
 
-    # ----- Evaluation (heavy / benchmark) -----------------------------------
+    # ----- Evaluation (heavy / periodic) ------------------------------------
 
     @staticmethod
     def fid() -> str:

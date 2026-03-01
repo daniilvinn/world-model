@@ -7,12 +7,30 @@ and flat-world detection (a known failure mode in Neural Dash).
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
 
 from logger.metric_names import M
+
+
+def _infer_decoder_device(vqvae_decoder: Callable, fallback: torch.device) -> torch.device:
+    """
+    Resolve decoder device for both module-style and bound-method decoders.
+    """
+    if hasattr(vqvae_decoder, "parameters"):
+        try:
+            return next(vqvae_decoder.parameters()).device
+        except (StopIteration, TypeError):
+            return fallback
+    owner = getattr(vqvae_decoder, "__self__", None)
+    if owner is not None and hasattr(owner, "parameters"):
+        try:
+            return next(owner.parameters()).device
+        except (StopIteration, TypeError):
+            return fallback
+    return fallback
 
 
 @torch.no_grad()
@@ -106,7 +124,7 @@ def compute_time_to_collapse(
 def evaluate_failure_metrics(
     rollout_batch: List[torch.Tensor],
     horizons: Sequence[int],
-    vqvae_decoder: Optional[torch.nn.Module] = None,
+    vqvae_decoder: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> Dict[str, float]:
     """
     Full failure / collapse analysis.
@@ -121,12 +139,14 @@ def evaluate_failure_metrics(
     decoded_batch = rollout_batch
     if vqvae_decoder is not None:
         decoded_batch = []
+        fallback_device = rollout_batch[0].device if rollout_batch else torch.device("cpu")
+        decoder_device = _infer_decoder_device(vqvae_decoder, fallback_device)
         for rollout in rollout_batch:
             T = rollout.shape[0]
             decoded_frames = torch.cat(
-                [vqvae_decoder(rollout[i:i+1]) for i in range(T)], dim=0
+                [vqvae_decoder(rollout[i:i+1].to(decoder_device)) for i in range(T)], dim=0
             )
-            decoded_batch.append((decoded_frames + 1) / 2)
+            decoded_batch.append(((decoded_frames + 1) / 2).cpu())
 
     for H in horizons:
         results[M.collapse_rate(H)] = compute_collapse_rate(decoded_batch, H)

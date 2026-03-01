@@ -370,7 +370,7 @@ def train(args):
 
         # Gradient stats are epoch-based to keep all metrics on the same axis.
         if grad_enabled:
-            grad_stats = compute_gradient_stats(model, grad_modules)
+            grad_stats = compute_gradient_stats(model, grad_modules, model_name="VQ-VAE")
             wb.log(grad_stats, step=epoch_step, commit=False)
 
         # --------------- Validation ---------------

@@ -18,6 +18,7 @@ import torch.nn.functional as F
 def get_fvd_features(
     videos: torch.Tensor,
     detector: Optional[torch.nn.Module] = None,
+    device: Optional[torch.device] = None,
 ) -> np.ndarray:
     """
     Extract per-video feature vectors for FVD computation.
@@ -31,18 +32,19 @@ def get_fvd_features(
         [N, D] feature matrix as numpy array.
     """
     if detector is not None:
-        return _extract_i3d(videos, detector)
-    return _extract_inception_mean(videos)
+        return _extract_i3d(videos, detector, device=device)
+    return _extract_inception_mean(videos, device=device)
 
 
-def _extract_inception_mean(videos: torch.Tensor) -> np.ndarray:
+def _extract_inception_mean(videos: torch.Tensor, device: Optional[torch.device] = None) -> np.ndarray:
     """Fallback: extract InceptionV3 features per frame, mean-pool over time."""
     try:
         from torchvision.models import inception_v3, Inception_V3_Weights
     except ImportError:
         raise ImportError("torchvision is required for FVD feature extraction.")
 
-    device = videos.device
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = inception_v3(weights=Inception_V3_Weights.DEFAULT).to(device).eval()
 
     for p in model.parameters():
@@ -55,7 +57,7 @@ def _extract_inception_mean(videos: torch.Tensor) -> np.ndarray:
     all_features = []
 
     for i in range(N):
-        frames = videos[i]  # [T, C, H, W]
+        frames = videos[i].to(device)  # [T, C, H, W]
         # Inception expects 299x299
         frames_resized = F.interpolate(frames, size=(299, 299), mode="bilinear", align_corners=False)
         with torch.no_grad():
@@ -65,15 +67,20 @@ def _extract_inception_mean(videos: torch.Tensor) -> np.ndarray:
     return np.stack(all_features)
 
 
-def _extract_i3d(videos: torch.Tensor, model: torch.nn.Module) -> np.ndarray:
+def _extract_i3d(
+    videos: torch.Tensor,
+    model: torch.nn.Module,
+    device: Optional[torch.device] = None,
+) -> np.ndarray:
     """Extract features using a provided I3D model."""
-    device = videos.device
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device).eval()
     N = videos.shape[0]
     all_features = []
 
     for i in range(N):
-        clip = videos[i].unsqueeze(0)  # [1, T, C, H, W]
+        clip = videos[i].unsqueeze(0).to(device)  # [1, T, C, H, W]
         clip = clip.permute(0, 2, 1, 3, 4)  # [1, C, T, H, W] for I3D
         with torch.no_grad():
             feat = model(clip)

@@ -18,6 +18,12 @@ from logger.metric_names import M
 from logger.wandb_logger import WandbLogger
 
 
+def _cuda_cleanup(device: torch.device) -> None:
+    """Best-effort CUDA cache cleanup after heavy eval chunks."""
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
 def _repeat_to_min_samples(items: list, min_samples: int) -> list:
     """Repeat elements cyclically so the returned list has at least min_samples."""
     if min_samples <= 0 or len(items) >= min_samples or not items:
@@ -29,6 +35,69 @@ def _repeat_to_min_samples(items: list, min_samples: int) -> list:
 def _decode_rollout_sequence(vqvae_model: nn.Module, latent_seq: torch.Tensor) -> torch.Tensor:
     """Decode latent rollout [T, C, H, W] into RGB [T, 3, H, W]."""
     return vqvae_model.decode(latent_seq)
+
+
+@torch.no_grad()
+def _rollout_latent_batch(
+    model: nn.Module,
+    predict_next_frame_fn,
+    initial_context: torch.Tensor,
+    action_seq: torch.Tensor,
+    num_ode_steps: int,
+    device: torch.device,
+    codebook: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """
+    Batched autoregressive rollout.
+
+    Args:
+        initial_context: [B, ctx, C, H, W]
+        action_seq: [B, T] action ids
+
+    Returns:
+        [B, T, C, H, W] generated latent rollouts.
+    """
+    B, T = action_seq.shape
+    context = initial_context
+    generated_steps_cpu: list = []
+
+    for t in range(T):
+        actions_t = action_seq[:, t]
+        z_next = predict_next_frame_fn(
+            model,
+            context,
+            actions_t,
+            num_steps=num_ode_steps,
+            device=device,
+            codebook=codebook,
+        )
+        generated_steps_cpu.append(z_next.detach().cpu())
+        context = torch.cat([context[:, 1:], z_next.unsqueeze(1)], dim=1)
+        del z_next
+        _cuda_cleanup(device)
+
+    return torch.stack(generated_steps_cpu, dim=1)
+
+
+@torch.no_grad()
+def _decode_rollout_sequence_chunked(
+    vqvae_model: nn.Module,
+    latent_seq: torch.Tensor,
+    device: torch.device,
+    chunk_size: int = 16,
+) -> torch.Tensor:
+    """
+    Decode rollout [T, C, H, W] in chunks to keep peak VRAM bounded.
+    """
+    decoded_chunks: list = []
+    T = latent_seq.shape[0]
+    for start in range(0, T, chunk_size):
+        end = min(start + chunk_size, T)
+        latent_gpu = latent_seq[start:end].to(device, non_blocking=True)
+        decoded_chunks.append(vqvae_model.decode(latent_gpu).detach().cpu())
+        del latent_gpu
+        _cuda_cleanup(device)
+    return torch.cat(decoded_chunks, dim=0)
 
 
 class EvalOrchestrator:
@@ -159,7 +228,7 @@ class EvalOrchestrator:
         Periodically computes: rollout quality, temporal stability, FVD,
         action metrics, failure analysis.
         """
-        from dynamics.inference import predict_next_frame, rollout
+        from dynamics.inference import predict_next_frame
 
         model.eval()
         vqvae_model.eval()
@@ -167,23 +236,31 @@ class EvalOrchestrator:
         all_metrics: Dict[str, float] = {}
         num_batches = 0
         one_step_accum: Dict[str, float] = {}
+        heavy = self.cfg.should_run_heavy_metrics(epoch)
+        real_images_np: list = []
+        fake_images_np: list = []
 
         for batch in val_loader:
             context_zq, targets_zq, actions = batch
-            context_zq = context_zq.to(self.device)
-            targets_zq = targets_zq.to(self.device)
-            actions = actions.to(self.device)
-
-            target_zq = targets_zq[:, 0] if targets_zq.dim() == 5 else targets_zq
-            action = actions[:, 0] if actions.dim() == 2 else actions
+            # One-step metrics use one sample per batch; avoid transferring full
+            # long-rollout tensors to GPU.
+            context_one = context_zq[:1].to(self.device, non_blocking=True)
+            if targets_zq.dim() == 5:
+                target_zq = targets_zq[:1, 0].to(self.device, non_blocking=True)
+            else:
+                target_zq = targets_zq[:1].to(self.device, non_blocking=True)
+            if actions.dim() == 2:
+                action = actions[0, 0].to(self.device, non_blocking=True)
+            else:
+                action = actions[0].to(self.device, non_blocking=True)
 
             with torch.no_grad():
                 pred_zq = predict_next_frame(
-                    model, context_zq, action[0].item(),
+                    model, context_one, action.item(),
                     num_steps=10, device=self.device, codebook=codebook,
                 )
 
-            gt_decoded = vqvae_model.decode(target_zq[:1])
+            gt_decoded = vqvae_model.decode(target_zq)
             pred_decoded = vqvae_model.decode(pred_zq[:1])
 
             from evaluation.single_frame_metrics import evaluate_single_frame
@@ -191,6 +268,18 @@ class EvalOrchestrator:
 
             for k, v in frame_metrics.items():
                 one_step_accum[k] = one_step_accum.get(k, 0.0) + v
+
+            # For smoke runs, collect one-step decoded frames so FID/KID can be
+            # computed even when rollout supervision length is tiny.
+            if heavy and self.cfg.should_run_metric("fid", epoch):
+                real_np = ((gt_decoded + 1) * 127.5).clamp(0, 255).byte().cpu().permute(0, 2, 3, 1).numpy()
+                fake_np = ((pred_decoded + 1) * 127.5).clamp(0, 255).byte().cpu().permute(0, 2, 3, 1).numpy()
+                for i in range(real_np.shape[0]):
+                    real_images_np.append(real_np[i])
+                    fake_images_np.append(fake_np[i])
+
+            del context_one, target_zq, action, pred_zq, gt_decoded, pred_decoded, frame_metrics
+            _cuda_cleanup(self.device)
             num_batches += 1
 
             if num_batches >= 50:
@@ -200,7 +289,40 @@ class EvalOrchestrator:
             for k, v in one_step_accum.items():
                 all_metrics[M.one_step(k)] = v / num_batches
 
-        heavy = self.cfg.should_run_heavy_metrics(epoch)
+        if heavy and self.cfg.should_run_metric("fid", epoch) and len(real_images_np) > 0:
+            try:
+                from evaluation.single_frame_metrics import compute_fid
+
+                num = min(len(real_images_np), self.cfg.metric_num_samples("fid"))
+                min_fid = self.cfg.metric_min_samples("fid", default=1)
+                real_fid = _repeat_to_min_samples(real_images_np[:num], min_fid)
+                fake_fid = _repeat_to_min_samples(fake_images_np[:num], min_fid)
+                all_metrics[M.fid()] = compute_fid(real_fid, fake_fid)
+            except ImportError:
+                print(
+                    "Skipping FID: torch-fidelity is not installed. "
+                    "Install with `pip install torch-fidelity`."
+                )
+            except Exception as e:
+                # Keep training robust in smoke runs with tiny data.
+                print(f"Skipping FID: metric backend failed ({type(e).__name__}: {e}).")
+
+            if self.cfg.should_run_metric("kid", epoch):
+                try:
+                    from evaluation.single_frame_metrics import compute_kid
+
+                    num_kid = min(len(real_images_np), self.cfg.metric_num_samples("kid"))
+                    min_kid = self.cfg.metric_min_samples("kid", default=2)
+                    real_kid = _repeat_to_min_samples(real_images_np[:num_kid], min_kid)
+                    fake_kid = _repeat_to_min_samples(fake_images_np[:num_kid], min_kid)
+                    all_metrics[M.kid()] = compute_kid(real_kid, fake_kid)
+                except ImportError:
+                    print(
+                        "Skipping KID: torch-fidelity is not installed. "
+                        "Install with `pip install torch-fidelity`."
+                    )
+                except Exception as e:
+                    print(f"Skipping KID: metric backend failed ({type(e).__name__}: {e}).")
 
         if heavy:
             self._run_heavy_dynamics_eval(
@@ -223,50 +345,81 @@ class EvalOrchestrator:
         results: Dict[str, float],
     ) -> None:
         """Run expensive rollout, temporal, action, and failure metrics."""
-        from dynamics.inference import rollout as run_rollout
+        from dynamics.inference import predict_next_frame
 
         horizons = self.cfg.short_horizons
+        fvd_horizons = self.cfg.fvd_clip_lengths if self.cfg.should_run_metric("fvd", epoch) else []
 
         rollout_batch: list = []
         gt_batch: list = []
         action_batch: list = []
 
-        max_h = max(horizons) if horizons else 64
-        num_eval_sequences = 10
+        # Generate long enough rollouts for both validation-at-horizon metrics
+        # and FVD clip-length metrics.
+        required_horizons = [*horizons, *fvd_horizons]
+        max_h = max(required_horizons) if required_horizons else 64
+        num_eval_sequences = 4
+        # Adaptive micro-batch for heavy rollout generation.
+        # Long rollouts are much more memory intensive, so keep batches tiny.
+        if max_h >= 512:
+            stream_batch_size = 1
+        elif max_h >= 256:
+            stream_batch_size = 2
+        else:
+            stream_batch_size = max(1, min(getattr(val_loader, "batch_size", 1) or 1, 4))
 
         count = 0
         for batch in val_loader:
             context_zq, targets_zq, actions = batch
-            context_zq = context_zq.to(self.device)
-            targets_zq = targets_zq.to(self.device)
-            actions = actions.to(self.device)
 
             B = context_zq.shape[0]
-            for b in range(B):
+            for start in range(0, B, stream_batch_size):
                 if count >= num_eval_sequences:
                     break
+                chunk_cap = min(stream_batch_size, num_eval_sequences - count)
+                end = min(start + chunk_cap, B)
 
-                action_seq_len = min(max_h, targets_zq.shape[1] if targets_zq.dim() == 5 else 1)
-                action_seq = actions[b, :action_seq_len].cpu().tolist() if actions.dim() == 2 else [actions[b].item()]
+                ctx_chunk = context_zq[start:end].to(self.device, non_blocking=True)
+                actions_chunk = actions[start:end]
 
-                if len(action_seq) < 2:
-                    action_seq = action_seq * max_h
+                if actions_chunk.dim() == 2:
+                    action_seq_len = min(max_h, actions_chunk.shape[1])
+                    action_seq = actions_chunk[:, :action_seq_len]
+                    if action_seq_len < max_h:
+                        pad = action_seq[:, -1:].repeat(1, max_h - action_seq_len)
+                        action_seq = torch.cat([action_seq, pad], dim=1)
+                else:
+                    action_seq = actions_chunk.reshape(-1, 1).repeat(1, max_h)
+                action_seq = action_seq.to(self.device, dtype=torch.long, non_blocking=True)
 
-                with torch.no_grad():
-                    gen_frames = run_rollout(
-                        model,
-                        context_zq[b:b+1],
-                        action_seq[:max_h],
-                        num_ode_steps=10,
-                        device=self.device,
-                        codebook=codebook,
-                    )
+                gen_chunk = _rollout_latent_batch(
+                    model=model,
+                    predict_next_frame_fn=predict_next_frame,
+                    initial_context=ctx_chunk,
+                    action_seq=action_seq,
+                    num_ode_steps=10,
+                    device=self.device,
+                    codebook=codebook,
+                )
+                gen_chunk_cpu = gen_chunk.detach().cpu()
 
-                rollout_batch.append(gen_frames)
                 if targets_zq.dim() == 5:
-                    gt_batch.append(targets_zq[b, :gen_frames.shape[0]])
-                action_batch.append(torch.tensor(action_seq[:gen_frames.shape[0]]))
-                count += 1
+                    gt_chunk_cpu = targets_zq[start:end, :gen_chunk_cpu.shape[1]].detach().cpu()
+                else:
+                    gt_chunk_cpu = None
+                action_seq_cpu = action_seq.detach().cpu()
+
+                for i in range(gen_chunk_cpu.shape[0]):
+                    rollout_batch.append(gen_chunk_cpu[i])
+                    if gt_chunk_cpu is not None:
+                        gt_batch.append(gt_chunk_cpu[i])
+                    action_batch.append(action_seq_cpu[i, :gen_chunk_cpu.shape[1]])
+
+                del ctx_chunk, action_seq, gen_chunk, gen_chunk_cpu, action_seq_cpu
+                if gt_chunk_cpu is not None:
+                    del gt_chunk_cpu
+                _cuda_cleanup(self.device)
+                count += end - start
 
             if count >= num_eval_sequences:
                 break
@@ -277,21 +430,28 @@ class EvalOrchestrator:
             from evaluation.failure_metrics import evaluate_failure_metrics
 
             for i, gen in enumerate(rollout_batch):
-                if i < len(gt_batch) and gt_batch[i].shape[0] == gen.shape[0]:
+                if i < len(gt_batch):
+                    common_t = min(gen.shape[0], gt_batch[i].shape[0])
+                    if common_t <= 0:
+                        continue
+                    gen_common = gen[:common_t].to(self.device, non_blocking=True)
+                    gt_common = gt_batch[i][:common_t].to(self.device, non_blocking=True)
                     rollout_results = evaluate_rollout_at_horizons(
-                        gen, gt_batch[i], horizons,
+                        gen_common, gt_common, horizons,
                         vqvae_decoder=vqvae_model.decode,
                     )
                     for k, v in rollout_results.items():
                         results[k] = results.get(k, 0.0) + v / len(rollout_batch)
 
                     temporal_results = evaluate_temporal(
-                        gt_batch[i], gen,
+                        gt_common, gen_common,
                         vqvae_decoder=vqvae_model.decode,
                         compute_flow=self.cfg.should_run_metric("optical_flow", epoch),
                     )
                     for k, v in temporal_results.items():
                         results[k] = results.get(k, 0.0) + v / len(rollout_batch)
+                    del gen_common, gt_common, rollout_results, temporal_results
+                    _cuda_cleanup(self.device)
 
             # FVD (video-level) at configured clip lengths/cadence.
             if self.cfg.should_run_metric("fvd", epoch):
@@ -299,11 +459,11 @@ class EvalOrchestrator:
                     from evaluation.video_metrics import evaluate_fvd_at_clip_lengths
 
                     # Keep only aligned pairs, cap by configured sample budget.
-                    aligned_pairs = [
-                        (gen, gt)
-                        for gen, gt in zip(rollout_batch, gt_batch)
-                        if gen.shape[0] == gt.shape[0]
-                    ]
+                    aligned_pairs = []
+                    for gen, gt in zip(rollout_batch, gt_batch):
+                        common_t = min(gen.shape[0], gt.shape[0])
+                        if common_t > 0:
+                            aligned_pairs.append((gen[:common_t], gt[:common_t]))
                     max_fvd_samples = self.cfg.metric_num_samples("fvd", default=1000)
                     aligned_pairs = aligned_pairs[:max_fvd_samples]
 
@@ -315,10 +475,18 @@ class EvalOrchestrator:
                         decoded_gen = []
                         decoded_gt = []
                         for gen_latent, gt_latent in aligned_pairs:
-                            gen_rgb = _decode_rollout_sequence(vqvae_model, gen_latent).detach()
-                            gt_rgb = _decode_rollout_sequence(vqvae_model, gt_latent).detach()
+                            gen_latent_gpu = gen_latent.to(self.device, non_blocking=True)
+                            gt_latent_gpu = gt_latent.to(self.device, non_blocking=True)
+                            gen_rgb = _decode_rollout_sequence_chunked(
+                                vqvae_model, gen_latent_gpu, self.device
+                            )
+                            gt_rgb = _decode_rollout_sequence_chunked(
+                                vqvae_model, gt_latent_gpu, self.device
+                            )
                             decoded_gen.append(gen_rgb)
                             decoded_gt.append(gt_rgb)
+                            del gen_latent_gpu, gt_latent_gpu
+                            _cuda_cleanup(self.device)
 
                         # Use the maximum common length across sequences.
                         common_t = min(t.shape[0] for t in decoded_gen)
@@ -329,13 +497,19 @@ class EvalOrchestrator:
                             real_videos = torch.stack(
                                 [v[:common_t].clamp(-1, 1).add(1).mul(0.5) for v in decoded_gt], dim=0
                             )
+                            clip_lengths = [h for h in self.cfg.fvd_clip_lengths if h <= common_t]
+                            if not clip_lengths:
+                                clip_lengths = [common_t]
                             fvd_results = evaluate_fvd_at_clip_lengths(
                                 real_videos=real_videos,
                                 fake_videos=fake_videos,
-                                clip_lengths=self.cfg.fvd_clip_lengths,
+                                clip_lengths=clip_lengths,
                                 device=self.device,
                             )
                             results.update(fvd_results)
+                            del fake_videos, real_videos, fvd_results
+                        del decoded_gen, decoded_gt
+                        _cuda_cleanup(self.device)
                 except ImportError:
                     pass
                 except Exception:
@@ -354,13 +528,16 @@ class EvalOrchestrator:
                 from evaluation.action_metrics import evaluate_action_metrics
                 for i, gen in enumerate(rollout_batch):
                     if i < len(action_batch):
-                        actions_t = action_batch[i].to(self.device)
+                        actions_t = action_batch[i].to(self.device, non_blocking=True)
+                        gen_gpu = gen.to(self.device, non_blocking=True)
                         action_results = evaluate_action_metrics(
-                            actions_t, gen,
+                            actions_t, gen_gpu,
                             vqvae_decoder=vqvae_model.decode,
                         )
                         for k, v in action_results.items():
                             results[k] = results.get(k, 0.0) + v / len(rollout_batch)
+                        del gen_gpu, actions_t, action_results
+                        _cuda_cleanup(self.device)
 
     # ------------------------------------------------------------------
     # Runtime profiling

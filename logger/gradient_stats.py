@@ -34,6 +34,7 @@ def _grad_stats_for_params(
 def compute_gradient_stats(
     model: nn.Module,
     module_names: Optional[List[str]] = None,
+    model_name: Optional[str] = None,
 ) -> Dict[str, float]:
     """
     Compute gradient statistics for a model.
@@ -42,6 +43,8 @@ def compute_gradient_stats(
         model: The model whose parameters have ``.grad`` populated.
         module_names: Named children to compute per-module stats for.
             If *None*, only global stats are returned.
+        model_name: Backward-call compatibility only; ignored.  Metrics are
+            run-scoped and grouped under ``Gradients/...``.
 
     Returns:
         Dictionary of ``{metric_name: value}`` ready for ``wandb.log``.
@@ -55,7 +58,7 @@ def compute_gradient_stats(
 
     global_stats = _grad_stats_for_params(all_params)
     for stat, value in global_stats.items():
-        results[M.gradient(stat, "Global")] = value
+        results[M.gradient(stat, "Global", model=model_name)] = value
 
     if module_names:
         named_children = dict(model.named_children())
@@ -67,7 +70,7 @@ def compute_gradient_stats(
             stats = _grad_stats_for_params(params)
             label = _module_label(name)
             for stat, value in stats.items():
-                results[M.gradient(stat, label)] = value
+                results[M.gradient(stat, label, model=model_name)] = value
 
     return results
 
