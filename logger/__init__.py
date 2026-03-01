@@ -1,5 +1,5 @@
 """
-Logging package for Neural Dash training and evaluation.
+Logging package for World Model training and evaluation.
 
 Provides a centralized WandbLogger, metric naming conventions,
 gradient statistics collection, and model architecture serialization.

@@ -1,21 +1,4 @@
-"""
-Training script for the Dynamics Model (Flow Matching with Diffusion Forcing).
-
-Usage:
-    python -m dynamics.train
-    python -m dynamics.train --epochs 100 --batch_size 64 --lr 3e-4
-    python -m dynamics.train --resume checkpoints/dynamics_latest.pt
-
-Hyperparameters:
-    Optimizer:  AdamW, lr=3e-4, betas=(0.9, 0.95), weight_decay=1e-4
-    Scheduler:  Linear warmup 10 epochs, then cosine decay to 1e-5
-    Batch size: 64
-    Epochs:     100 (early stopping, patience=15)
-    Mixed prec: FP16 autocast + GradScaler
-    Grad clip:  max_norm=1.0
-    Diffusion forcing: enabled, max_context_noise=0.2
-    EMA:        decay=0.999
-"""
+"""Training script for the dynamics model."""
 
 import argparse
 import os
@@ -32,19 +15,12 @@ from tqdm import tqdm
 
 from dynamics.model import DynamicsUNet
 from dynamics.dataset import create_dataloaders
-from dynamics.inference import predict_next_frame
 
 from evaluation.config import load_eval_config
 from evaluation.orchestrator import EvalOrchestrator
 from logger.wandb_logger import WandbLogger
 from logger.metric_names import M
 from logger.gradient_stats import compute_gradient_stats
-from logger.architecture import serialize_model_architecture
-
-
-# ---------------------------------------------------------------------------
-# EMA Model
-# ---------------------------------------------------------------------------
 
 
 class EMA:
@@ -73,11 +49,6 @@ class EMA:
         """Restore model weights (after applying EMA)."""
         for name, param in model.named_parameters():
             param.data.copy_(self.backup[name])
-
-
-# ---------------------------------------------------------------------------
-# Learning-rate schedule
-# ---------------------------------------------------------------------------
 
 
 def get_ss_probability(epoch, total_epochs, ss_start_epoch, ss_max_prob=0.5):
@@ -133,11 +104,6 @@ def build_scheduler(optimizer, warmup_epochs, total_epochs, steps_per_epoch, min
     )
 
 
-# ---------------------------------------------------------------------------
-# Flow Matching Training Step
-# ---------------------------------------------------------------------------
-
-
 def training_step(model, context_zq, target_zq, action, diffusion_forcing=True, max_context_noise=0.2):
     """
     Flow matching training step with optional diffusion forcing.
@@ -170,14 +136,9 @@ def training_step(model, context_zq, target_zq, action, diffusion_forcing=True, 
     return loss
 
 
-# ---------------------------------------------------------------------------
-# Rollout Training with Scheduled Sampling
-# ---------------------------------------------------------------------------
-
-
 def rollout_training_step(
     model, context_zq, targets_zq, actions, p_ss=0.5,
-    rollout_mode="fast", rollout_ode_steps=3, codebook=None,
+    rollout_ode_steps=3, codebook=None,
     diffusion_forcing=True, max_context_noise=0.2
 ):
     """
@@ -227,20 +188,10 @@ def rollout_training_step(
                 
                 dt = 1.0 / rollout_ode_steps
                 
-                if rollout_mode == "fast":
-                    for i in range(rollout_ode_steps):
-                        t_ode = torch.full((B,), i * dt, device=device)
-                        v = model(x, t_ode, context_flat, action)
-                        x = x + v * dt
-                
-                elif rollout_mode == "full_ode":
-                    for i in range(rollout_ode_steps):
-                        t_ode = torch.full((B,), i * dt, device=device)
-                        v = model(x, t_ode, context_flat, action)
-                        x = x + v * dt
-                
-                else:
-                    raise ValueError(f"Unknown rollout_mode: {rollout_mode}")
+                for i in range(rollout_ode_steps):
+                    t_ode = torch.full((B,), i * dt, device=device)
+                    v = model(x, t_ode, context_flat, action)
+                    x = x + v * dt
                 
                 if codebook is not None:
                     from dynamics.inference import quantize_latent
@@ -266,13 +217,8 @@ def rollout_training_step(
     return avg_loss
 
 
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
-
-
 @torch.no_grad()
-def validate(model, val_loader, device, rollout_length=1, rollout_mode="fast", 
+def validate(model, val_loader, device, rollout_length=1,
              rollout_ode_steps=3, codebook=None, diffusion_forcing=True, max_context_noise=0.2):
     """
     Run validation and return average loss.
@@ -295,7 +241,6 @@ def validate(model, val_loader, device, rollout_length=1, rollout_mode="fast",
             loss = rollout_training_step(
                 model, context_zq, targets_zq, actions,
                 p_ss=0.0,
-                rollout_mode=rollout_mode,
                 rollout_ode_steps=rollout_ode_steps,
                 codebook=codebook,
                 diffusion_forcing=diffusion_forcing,
@@ -308,11 +253,6 @@ def validate(model, val_loader, device, rollout_length=1, rollout_mode="fast",
     model.train()
     avg_loss = total_loss / max(num_batches, 1)
     return avg_loss
-
-
-# ---------------------------------------------------------------------------
-# Main training function
-# ---------------------------------------------------------------------------
 
 
 def train(args):
@@ -387,7 +327,6 @@ def train(args):
     if device.type == "cuda":
         print(f"Mixed precision (FP16) enabled")
 
-    # --- W&B Logger ---
     eval_config = load_eval_config(args.wandb_config)
     run_config = {
         "model": "Dynamics UNet",
@@ -408,11 +347,14 @@ def train(args):
         "diffusion_forcing": args.diffusion_forcing,
         "max_context_noise": args.max_context_noise,
         "rollout_length": args.rollout_length,
-        "rollout_mode": args.rollout_mode,
         "rollout_ode_steps": args.rollout_ode_steps,
         "ss_start_epoch": args.ss_start_epoch,
         "ss_max_prob": args.ss_max_prob,
         "ema_decay": args.ema_decay,
+        "eval_chunk_size": args.eval_chunk_size,
+        "num_eval_sequences": args.num_eval_sequences,
+        "eval_ode_steps": args.eval_ode_steps,
+        "max_one_step_batches": args.max_one_step_batches,
         "eval_config": eval_config.raw,
     }
     wb = WandbLogger(
@@ -431,8 +373,6 @@ def train(args):
         "num_actions": args.num_actions,
     })
 
-    # Build a dedicated validation loader for evaluation metrics so rollout
-    # metrics/FVD can cover configured horizons even when training rollout is short.
     eval_rollout_length = args.rollout_length
     if eval_config.short_horizons:
         eval_rollout_length = max(eval_rollout_length, max(eval_config.short_horizons))
@@ -456,7 +396,6 @@ def train(args):
             max_samples=args.max_samples,
         )
 
-    # Load VQ-VAE for eval orchestrator (if checkpoint exists)
     vqvae_model = None
     if os.path.exists(args.vqvae_checkpoint):
         from vqvae.model import VQVAE
@@ -471,12 +410,17 @@ def train(args):
         vqvae_model.load_state_dict(vqvae_ckpt["model_state_dict"])
         vqvae_model.eval()
 
-    orchestrator = EvalOrchestrator(eval_config, wb, device)
+    orchestrator = EvalOrchestrator(
+        eval_config,
+        wb,
+        device,
+        eval_chunk_size=args.eval_chunk_size,
+        num_eval_sequences=args.num_eval_sequences,
+        eval_ode_steps=args.eval_ode_steps,
+    )
 
-    # Checkpointing
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     
-    # Resume from checkpoint
     start_epoch = 0
     best_val_loss = float("inf")
     patience_counter = 0
@@ -494,11 +438,9 @@ def train(args):
         global_step = ckpt.get("global_step", start_epoch * steps_per_epoch)
         print(f"Resumed at epoch {start_epoch}, global_step {global_step}")
 
-    # Gradient stats config (epoch-based logging)
     grad_enabled = eval_config.gradient_stats_enabled
     grad_modules = eval_config.gradient_modules("dynamics")
 
-    # --------------- Training Loop ---------------
     print(f"\n{'='*60}")
     print(f"Training Dynamics Model for {args.epochs} epochs")
     print(f"{'='*60}\n")
@@ -531,14 +473,12 @@ def train(args):
                     loss = rollout_training_step(
                         model, context_zq, targets_zq, actions,
                         p_ss=epoch_ss_prob,
-                        rollout_mode=args.rollout_mode,
                         rollout_ode_steps=args.rollout_ode_steps,
                         codebook=codebook,
                         diffusion_forcing=args.diffusion_forcing,
                         max_context_noise=args.max_context_noise
                     )
             
-            # Backward pass
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -548,24 +488,20 @@ def train(args):
             scaler.update()
             scheduler.step()
             
-            # Update EMA
             ema.update(model)
             
             global_step += 1
             epoch_loss += loss.item()
             
-            # Update progress bar
             if args.rollout_length > 1:
                 pbar.set_postfix({"loss": f"{loss.item():.4f}", "ss_prob": f"{epoch_ss_prob:.3f}"})
             else:
                 pbar.set_postfix({"loss": f"{loss.item():.4f}"})
         
-        # Epoch summary
         epoch_time = time.time() - epoch_start
         avg_epoch_loss = epoch_loss / max(len(train_loader), 1)
         print(f"\nEpoch {epoch+1} train (avg) | loss: {avg_epoch_loss:.4f} | time: {epoch_time:.1f}s")
 
-        # W&B train metrics (epoch-based step)
         current_lr = optimizer.param_groups[0]["lr"]
         train_log = {
             M.train_loss("Velocity MSE"): avg_epoch_loss,
@@ -575,16 +511,13 @@ def train(args):
             train_log[M.scheduled_sampling_prob()] = epoch_ss_prob
         wb.log(train_log, step=epoch_step)
 
-        # Gradient stats are epoch-based to keep all metrics on the same axis.
         if grad_enabled:
             grad_stats = compute_gradient_stats(model, grad_modules)
             wb.log(grad_stats, step=epoch_step)
         
-        # --------------- Validation ---------------
         val_loss = validate(
             model, val_loader, device,
             rollout_length=args.rollout_length,
-            rollout_mode=args.rollout_mode,
             rollout_ode_steps=args.rollout_ode_steps,
             codebook=codebook,
             diffusion_forcing=args.diffusion_forcing,
@@ -594,14 +527,13 @@ def train(args):
         
         wb.log({M.val_loss("Velocity MSE"): val_loss}, step=epoch_step)
 
-        # --------------- Evaluation Orchestrator ---------------
         if vqvae_model is not None:
             orchestrator.run_dynamics_epoch_eval(
                 model, vqvae_model, eval_val_loader,
                 epoch_step, epoch_step, codebook,
+                max_one_step_batches=args.max_one_step_batches,
             )
         
-        # --------------- Checkpointing ---------------
         checkpoint = {
             "epoch": epoch,
             "global_step": global_step,
@@ -625,21 +557,22 @@ def train(args):
                 "diffusion_forcing": args.diffusion_forcing,
                 "max_context_noise": args.max_context_noise,
                 "rollout_length": args.rollout_length,
-                "rollout_mode": args.rollout_mode,
                 "rollout_ode_steps": args.rollout_ode_steps,
                 "ss_start_epoch": args.ss_start_epoch,
                 "ss_max_prob": args.ss_max_prob,
                 "ema_decay": args.ema_decay,
+                "eval_chunk_size": args.eval_chunk_size,
+                "num_eval_sequences": args.num_eval_sequences,
+                "eval_ode_steps": args.eval_ode_steps,
+                "max_one_step_batches": args.max_one_step_batches,
             },
         }
         
-        # Save latest
         latest_path = os.path.join(args.checkpoint_dir, "dynamics_latest.pt")
         torch.save(checkpoint, latest_path)
         if eval_config.log_latest_checkpoint:
             wb.log_checkpoint(latest_path, "dynamics-latest", metadata={"epoch": epoch, "val_loss": val_loss})
         
-        # Save best
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
@@ -653,7 +586,6 @@ def train(args):
             patience_counter += 1
             print(f"No improvement ({patience_counter}/{args.patience})")
         
-        # Early stopping
         if patience_counter >= args.patience:
             print(f"\nEarly stopping triggered after {epoch+1} epochs "
                   f"(no improvement for {args.patience} epochs)")
@@ -665,11 +597,6 @@ def train(args):
     wb.finish()
     print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
     print(f"Best model saved to: {os.path.join(args.checkpoint_dir, 'dynamics_best.pt')}")
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 def parse_args():
@@ -726,14 +653,22 @@ def parse_args():
     # Rollout training & scheduled sampling
     parser.add_argument("--rollout_length", type=int, default=1,
                         help="Number of frames to predict in rollout (1 = single-step, 2-4 = multi-step)")
-    parser.add_argument("--rollout_mode", type=str, default="fast", choices=["fast", "full_ode"],
-                        help="Rollout training mode: fast (2-3 ODE steps) or full_ode (10-20 steps)")
     parser.add_argument("--rollout_ode_steps", type=int, default=3,
                         help="ODE integration steps for prediction generation during rollout training")
     parser.add_argument("--ss_start_epoch", type=int, default=20,
                         help="Epoch to start scheduled sampling")
     parser.add_argument("--ss_max_prob", type=float, default=0.5,
                         help="Maximum scheduled sampling probability (use model predictions)")
+
+    # Evaluation controls
+    parser.add_argument("--eval_chunk_size", type=int, default=16,
+                        help="Chunk size for latent->RGB decode during heavy eval")
+    parser.add_argument("--num_eval_sequences", type=int, default=4,
+                        help="Number of sequences sampled for heavy rollout eval")
+    parser.add_argument("--eval_ode_steps", type=int, default=10,
+                        help="ODE integration steps used by evaluation rollouts/one-step metrics")
+    parser.add_argument("--max_one_step_batches", type=int, default=50,
+                        help="Maximum batches for one-step eval in each eval epoch (0 disables cap)")
     
     # EMA
     parser.add_argument("--ema_decay", type=float, default=0.999,

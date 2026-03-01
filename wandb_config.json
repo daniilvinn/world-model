@@ -6,11 +6,6 @@
             "num_samples": 5000,
             "min_samples": 2
         },
-        "kid": {
-            "frequency": 5,
-            "num_samples": 5000,
-            "min_samples": 2
-        },
         "fvd": {
             "frequency": 5,
             "num_samples": 1000

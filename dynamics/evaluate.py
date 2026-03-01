@@ -1,14 +1,4 @@
-"""
-Standalone evaluation for the Dynamics Model.
-
-Usage:
-    python -m dynamics.evaluate
-    python -m dynamics.evaluate --dynamics_checkpoint checkpoints/dynamics_best.pt --heavy_metrics
-
-Runs one-step and rollout quality metrics, temporal stability analysis,
-action/control metrics, failure detection, and optionally FVD.
-All results are logged to W&B.
-"""
+"""Standalone evaluation for the dynamics model."""
 
 import argparse
 import os
@@ -17,7 +7,7 @@ import torch
 from tqdm import tqdm
 
 from dynamics.model import DynamicsUNet
-from dynamics.inference import predict_next_frame, rollout as run_rollout, quantize_latent
+from dynamics.inference import predict_next_frame, rollout as run_rollout
 from vqvae.model import VQVAE
 
 from evaluation.config import load_eval_config
@@ -67,17 +57,15 @@ def evaluate(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Load models
     print(f"Loading dynamics model: {args.dynamics_checkpoint}")
     dynamics_model, dyn_cfg, dyn_ckpt = _load_dynamics(args.dynamics_checkpoint, device)
     print(f"  Epoch: {dyn_ckpt.get('epoch', '?')}, val_loss: {dyn_ckpt.get('val_loss', '?')}")
 
     print(f"Loading VQ-VAE: {args.vqvae_checkpoint}")
-    vqvae_model, vqvae_cfg = _load_vqvae(args.vqvae_checkpoint, device)
+    vqvae_model, _ = _load_vqvae(args.vqvae_checkpoint, device)
 
     codebook = vqvae_model.quantizer.embedding.detach().clone()
 
-    # Data
     from dynamics.dataset import create_dataloaders
     _, val_loader, _ = create_dataloaders(
         latents_dir=args.latents_dir,
@@ -91,7 +79,6 @@ def evaluate(args):
 
     eval_config = load_eval_config(args.wandb_config)
 
-    # --- W&B ---
     wb = WandbLogger(
         config={
             "model": "Dynamics UNet",
@@ -112,7 +99,6 @@ def evaluate(args):
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # ----- One-step metrics -------------------------------------------------
     print("\nComputing one-step metrics...")
     one_step_accum = {}
     num_batches = 0
@@ -128,8 +114,8 @@ def evaluate(args):
 
         with torch.no_grad():
             pred_zq = predict_next_frame(
-                dynamics_model, context_zq, action[0].item(),
-                num_steps=args.ode_steps, device=device, codebook=codebook,
+                dynamics_model, context_zq[:1], action[0].item(),
+                num_steps=args.eval_ode_steps, device=device, codebook=codebook,
             )
 
         gt_decoded = vqvae_model.decode(target_zq[:1])
@@ -140,7 +126,7 @@ def evaluate(args):
             one_step_accum[k] = one_step_accum.get(k, 0.0) + v
         num_batches += 1
 
-        if num_batches >= args.max_eval_batches:
+        if args.max_one_step_batches > 0 and num_batches >= args.max_one_step_batches:
             break
 
     one_step_avg = {M.one_step(k): v / num_batches for k, v in one_step_accum.items()}
@@ -149,7 +135,6 @@ def evaluate(args):
         print(f"  {k}: {v:.4f}")
     wb.log(one_step_avg)
 
-    # ----- Rollout metrics --------------------------------------------------
     print("\nGenerating rollouts for evaluation...")
     horizons = eval_config.short_horizons
     max_h = max(horizons) if horizons else 64
@@ -167,7 +152,7 @@ def evaluate(args):
 
         B = context_zq.shape[0]
         for b in range(B):
-            if count >= args.num_eval_rollouts:
+            if count >= args.num_eval_sequences:
                 break
 
             action_seq_len = min(max_h, targets_zq.shape[1] if targets_zq.dim() == 5 else 1)
@@ -180,7 +165,7 @@ def evaluate(args):
                 gen_frames = run_rollout(
                     dynamics_model, context_zq[b:b+1],
                     action_seq[:max_h],
-                    num_ode_steps=args.ode_steps,
+                    num_ode_steps=args.eval_ode_steps,
                     device=device, codebook=codebook,
                 )
 
@@ -190,10 +175,9 @@ def evaluate(args):
             action_batch.append(torch.tensor(action_seq[:gen_frames.shape[0]]))
             count += 1
 
-        if count >= args.num_eval_rollouts:
+        if count >= args.num_eval_sequences:
             break
 
-    # Rollout quality
     rollout_results = {}
     for i, gen in enumerate(rollout_batch):
         if i < len(gt_batch) and gt_batch[i].shape[0] == gen.shape[0]:
@@ -209,7 +193,6 @@ def evaluate(args):
         print(f"  {k}: {v:.4f}")
     wb.log(rollout_results)
 
-    # Temporal stability
     print("\nComputing temporal metrics...")
     temporal_results = {}
     for i, gen in enumerate(rollout_batch):
@@ -226,7 +209,6 @@ def evaluate(args):
         print(f"  {k}: {v:.4f}")
     wb.log(temporal_results)
 
-    # Action metrics
     if args.heavy_metrics:
         print("\nComputing action metrics...")
         action_results = {}
@@ -243,7 +225,6 @@ def evaluate(args):
             print(f"  {k}: {v:.4f}")
         wb.log(action_results)
 
-    # Failure metrics
     print("\nComputing failure metrics...")
     collapse_horizons = [h for h in [64, 128, 256] if h <= max_h]
     if collapse_horizons and rollout_batch:
@@ -255,7 +236,6 @@ def evaluate(args):
             print(f"  {k}: {v:.4f}")
         wb.log(failure_results)
 
-    # Runtime profiling
     print("\nProfiling runtime...")
     profiler = RuntimeProfiler(device)
     profiler.start()
@@ -265,7 +245,7 @@ def evaluate(args):
             with torch.no_grad():
                 predict_next_frame(
                     dynamics_model, test_context, 0,
-                    num_steps=args.ode_steps, device=device, codebook=codebook,
+                    num_steps=args.eval_ode_steps, device=device, codebook=codebook,
                 )
             profiler.tick()
         runtime_results = profiler.finish()
@@ -277,11 +257,6 @@ def evaluate(args):
     print("\nEvaluation complete.")
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate trained Dynamics Model")
 
@@ -291,13 +266,16 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="eval_output_dynamics")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--ode_steps", type=int, default=10)
+    parser.add_argument("--eval_ode_steps", type=int, default=10,
+                        help="ODE integration steps used in evaluation")
+    parser.add_argument("--eval_chunk_size", type=int, default=16,
+                        help="Chunk size for decode-heavy eval steps (reserved for parity with training CLI)")
+    parser.add_argument("--num_eval_sequences", type=int, default=20,
+                        help="Number of rollout sequences for evaluation")
+    parser.add_argument("--max_one_step_batches", type=int, default=100,
+                        help="Maximum batches for one-step eval (0 disables cap)")
     parser.add_argument("--eval_rollout_length", type=int, default=4,
                         help="Rollout length for dataset loading")
-    parser.add_argument("--num_eval_rollouts", type=int, default=20,
-                        help="Number of rollouts for evaluation")
-    parser.add_argument("--max_eval_batches", type=int, default=100,
-                        help="Max batches for one-step eval")
     parser.add_argument("--heavy_metrics", action="store_true",
                         help="Compute heavy metrics (FVD, action metrics, optical flow)")
 

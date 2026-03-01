@@ -1,14 +1,9 @@
-"""
-Single-frame visual quality metrics.
-
-Covers: MSE, MAE, Huber, PSNR, SSIM (with l/c/s components), LPIPS,
-FID, KID, codebook perplexity, and codebook utilization.
-"""
+"""Single-frame visual quality metrics."""
 
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -18,11 +13,6 @@ import torch.nn.functional as F
 from logger.metric_names import M
 
 
-# ---------------------------------------------------------------------------
-# Pixel-level
-# ---------------------------------------------------------------------------
-
-
 def compute_mse(pred: torch.Tensor, target: torch.Tensor) -> float:
     """Mean Squared Error over a batch.  Inputs in [-1, 1]."""
     return F.mse_loss(pred, target).item()
@@ -30,15 +20,6 @@ def compute_mse(pred: torch.Tensor, target: torch.Tensor) -> float:
 
 def compute_mae(pred: torch.Tensor, target: torch.Tensor) -> float:
     return F.l1_loss(pred, target).item()
-
-
-def compute_huber(pred: torch.Tensor, target: torch.Tensor, delta: float = 1.0) -> float:
-    return F.smooth_l1_loss(pred, target, beta=delta).item()
-
-
-# ---------------------------------------------------------------------------
-# PSNR
-# ---------------------------------------------------------------------------
 
 
 def compute_psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
@@ -51,11 +32,6 @@ def compute_psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
     if mse < 1e-10:
         return 100.0
     return 10.0 * math.log10(4.0 / mse)
-
-
-# ---------------------------------------------------------------------------
-# SSIM (with l / c / s components)
-# ---------------------------------------------------------------------------
 
 
 def _gaussian_kernel_1d(size: int, sigma: float, device: torch.device) -> torch.Tensor:
@@ -75,13 +51,11 @@ def compute_ssim(
     pred: torch.Tensor,
     target: torch.Tensor,
     window_size: int = 11,
-    return_components: bool = False,
-) -> Dict[str, float]:
+) -> float:
     """
     Structural Similarity Index Measure.
 
-    Inputs in [-1, 1].  Returns dict with keys ``"ssim"`` and optionally
-    ``"l"``, ``"c"``, ``"s"`` luminance / contrast / structure components.
+    Inputs in [-1, 1].
     """
     C1 = (0.01 * 2) ** 2
     C2 = (0.03 * 2) ** 2
@@ -109,24 +83,7 @@ def compute_ssim(
         (mu_x2 + mu_y2 + C1) * (sigma_x2 + sigma_y2 + C2)
     )
 
-    result: Dict[str, float] = {"ssim": ssim_map.mean().item()}
-
-    if return_components:
-        l_comp = (2 * mu_xy + C1) / (mu_x2 + mu_y2 + C1)
-        sigma_x = sigma_x2.sqrt()
-        sigma_y = sigma_y2.sqrt()
-        c_comp = (2 * sigma_x * sigma_y + C2) / (sigma_x2 + sigma_y2 + C2)
-        s_comp = (sigma_xy + C3) / (sigma_x * sigma_y + C3)
-        result["l"] = l_comp.mean().item()
-        result["c"] = c_comp.mean().item()
-        result["s"] = s_comp.mean().item()
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# LPIPS (wraps vqvae.losses.PerceptualLoss or lpips directly)
-# ---------------------------------------------------------------------------
+    return ssim_map.mean().item()
 
 
 _lpips_model: Optional[Any] = None
@@ -151,11 +108,6 @@ def compute_lpips(pred: torch.Tensor, target: torch.Tensor) -> float:
     return model(pred.float(), target.float()).mean().item()
 
 
-# ---------------------------------------------------------------------------
-# FID / KID (using clean-fid or torch-fidelity)
-# ---------------------------------------------------------------------------
-
-
 @torch.no_grad()
 def compute_fid(
     real_images: List[np.ndarray],
@@ -168,21 +120,6 @@ def compute_fid(
     """
     from evaluation._fidelity_helpers import fid_from_arrays
     return fid_from_arrays(real_images, fake_images)
-
-
-@torch.no_grad()
-def compute_kid(
-    real_images: List[np.ndarray],
-    fake_images: List[np.ndarray],
-) -> float:
-    """Kernel Inception Distance between two sets of uint8 HWC images."""
-    from evaluation._fidelity_helpers import kid_from_arrays
-    return kid_from_arrays(real_images, fake_images)
-
-
-# ---------------------------------------------------------------------------
-# Codebook statistics
-# ---------------------------------------------------------------------------
 
 
 @torch.no_grad()
@@ -224,16 +161,10 @@ def compute_codebook_stats(
     }
 
 
-# ---------------------------------------------------------------------------
-# Batch evaluation helper
-# ---------------------------------------------------------------------------
-
-
 @torch.no_grad()
 def evaluate_single_frame(
     pred: torch.Tensor,
     target: torch.Tensor,
-    compute_components: bool = False,
 ) -> Dict[str, float]:
     """
     Compute all single-frame pixel/perceptual metrics on a batch.
@@ -246,12 +177,7 @@ def evaluate_single_frame(
     results["MAE"] = compute_mae(pred, target)
     results["PSNR"] = compute_psnr(pred, target)
 
-    ssim_out = compute_ssim(pred, target, return_components=compute_components)
-    results["SSIM"] = ssim_out["ssim"]
-    if compute_components:
-        results["SSIM (Luminance)"] = ssim_out["l"]
-        results["SSIM (Contrast)"] = ssim_out["c"]
-        results["SSIM (Structure)"] = ssim_out["s"]
+    results["SSIM"] = compute_ssim(pred, target)
 
     results["LPIPS"] = compute_lpips(pred, target)
 

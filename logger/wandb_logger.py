@@ -1,5 +1,5 @@
 """
-Centralized Weights & Biases logger for Neural Dash.
+Centralized Weights & Biases logger for World Model.
 
 Wraps all ``wandb`` interactions so that training and evaluation scripts
 never call ``wandb`` directly.  Provides:
@@ -82,7 +82,7 @@ class WandbLogger:
             all_tags.extend(tags)
 
         self._run = wandb.init(
-            project=os.environ.get("WANDB_PROJECT", "neural-dash"),
+            project=os.environ.get("WANDB_PROJECT", "world-model"),
             entity=os.environ.get("WANDB_ENTITY", None),
             group=group if group is not None else os.environ.get("WANDB_RUN_GROUP", None),
             name=run_name,

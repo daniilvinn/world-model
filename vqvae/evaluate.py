@@ -1,18 +1,4 @@
-"""
-Evaluation and visualization for trained VQ-VAE.
-
-Usage:
-    python -m vqvae.evaluate --checkpoint checkpoints/vqvae_best.pt
-    python -m vqvae.evaluate --checkpoint checkpoints/vqvae_best.pt --full_res --num_images 16
-
-Features:
-    1. Reconstruction grid: side-by-side original vs reconstructed at 256x512
-    2. Full-resolution output: decode and resize to native 840x420
-    3. Codebook statistics: usage histogram, utilization rate, perplexity
-    4. Single-frame metrics: PSNR, SSIM, LPIPS, MSE, MAE
-    5. FID / KID (when --heavy_metrics is set)
-    6. All results logged to W&B
-"""
+"""Evaluation and visualization for a trained VQ-VAE."""
 
 import argparse
 import os
@@ -29,27 +15,13 @@ from vqvae.model import VQVAE
 from vqvae.dataset import create_dataloaders
 
 from evaluation.config import load_eval_config
+from evaluation._fidelity_helpers import ensure_min_samples
 from evaluation.single_frame_metrics import (
     evaluate_single_frame,
-    compute_codebook_stats,
     compute_fid,
-    compute_kid,
 )
 from logger.wandb_logger import WandbLogger
 from logger.metric_names import M
-from logger.architecture import serialize_model_architecture
-
-
-def _repeat_to_min_samples(items: list, min_samples: int) -> list:
-    """Repeat elements cyclically so the returned list has at least min_samples."""
-    if min_samples <= 0 or len(items) >= min_samples or not items:
-        return items
-    return [items[i % len(items)] for i in range(min_samples)]
-
-
-# ---------------------------------------------------------------------------
-# Reconstruction grid (256x512)
-# ---------------------------------------------------------------------------
 
 
 @torch.no_grad()
@@ -88,11 +60,6 @@ def make_reconstruction_grid(model, val_loader, device, num_images=8):
     )
 
     return grid, originals, x_recon
-
-
-# ---------------------------------------------------------------------------
-# Full-resolution (840x420) output
-# ---------------------------------------------------------------------------
 
 
 @torch.no_grad()
@@ -149,11 +116,6 @@ def save_full_resolution_samples(model, val_loader, device, save_dir, num_images
         )
 
     print(f"Saved {num_images} full-resolution samples to {save_dir}")
-
-
-# ---------------------------------------------------------------------------
-# Codebook statistics
-# ---------------------------------------------------------------------------
 
 
 @torch.no_grad()
@@ -251,21 +213,14 @@ def save_usage_histogram(stats, save_path):
         print("matplotlib not installed -- skipping histogram plot")
 
 
-# ---------------------------------------------------------------------------
-# Main evaluation
-# ---------------------------------------------------------------------------
-
-
 def evaluate(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Load checkpoint
     print(f"Loading checkpoint: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     config = ckpt.get("config", {})
 
-    # Create model with same config
     model = VQVAE(
         latent_dim=config.get("latent_dim", 16),
         num_embeddings=config.get("num_embeddings", 1024),
@@ -279,7 +234,6 @@ def evaluate(args):
     val_loss = ckpt.get("val_loss", "?")
     print(f"Loaded model from epoch {epoch}, val_loss={val_loss}")
 
-    # Data (validation only)
     _, val_loader = create_dataloaders(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
@@ -289,7 +243,6 @@ def evaluate(args):
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    # --- W&B Logger ---
     eval_config = load_eval_config(args.wandb_config)
     wb = WandbLogger(
         config={
@@ -309,7 +262,6 @@ def evaluate(args):
         "num_embeddings": config.get("num_embeddings", 1024),
     })
 
-    # 1. Reconstruction grid
     print("\nGenerating reconstruction grid...")
     grid, originals, reconstructions = make_reconstruction_grid(
         model, val_loader, device, num_images=args.num_images
@@ -319,7 +271,6 @@ def evaluate(args):
     print(f"Saved reconstruction grid to {grid_path}")
     wb.log_image("Evaluation/Reconstruction Grid", grid_path)
 
-    # 2. Full-resolution output
     if args.full_res:
         print("\nGenerating full-resolution (840x420) samples...")
         full_res_dir = os.path.join(output_dir, "full_resolution")
@@ -327,7 +278,6 @@ def evaluate(args):
             model, val_loader, device, full_res_dir, num_images=args.num_images
         )
 
-    # 3. Single-frame metrics (averaged over validation set)
     print("\nComputing single-frame metrics...")
     all_frame_metrics = {}
     num_batches = 0
@@ -339,7 +289,7 @@ def evaluate(args):
         with torch.no_grad():
             x_recon, _, _, _ = model(x)
 
-        frame_metrics = evaluate_single_frame(x_recon, x, compute_components=True)
+        frame_metrics = evaluate_single_frame(x_recon, x)
         for k, v in frame_metrics.items():
             all_frame_metrics[k] = all_frame_metrics.get(k, 0.0) + v
         num_batches += 1
@@ -358,7 +308,6 @@ def evaluate(args):
     wandb_frame = {f"Evaluation/{k}": v for k, v in avg_frame_metrics.items()}
     wb.log(wandb_frame)
 
-    # 4. Codebook statistics
     print("\nComputing codebook statistics...")
     stats = compute_codebook_stats_full(model, val_loader, device)
     print_codebook_stats(stats)
@@ -371,15 +320,13 @@ def evaluate(args):
     save_usage_histogram(stats, hist_path)
     wb.log_image("Evaluation/Codebook Usage Histogram", hist_path)
 
-    # 5. FID / KID
     if args.heavy_metrics and len(real_images_np) > 0:
-        print("\nComputing FID / KID...")
+        print("\nComputing FID...")
         num_samples = min(len(real_images_np), eval_config.metric_num_samples("fid"))
         fid_min_samples = eval_config.metric_min_samples("fid", default=1)
-        kid_min_samples = eval_config.metric_min_samples("kid", default=1)
 
-        real_fid = _repeat_to_min_samples(real_images_np[:num_samples], fid_min_samples)
-        fake_fid = _repeat_to_min_samples(fake_images_np[:num_samples], fid_min_samples)
+        real_fid = ensure_min_samples(real_images_np[:num_samples], fid_min_samples)
+        fake_fid = ensure_min_samples(fake_images_np[:num_samples], fid_min_samples)
         try:
             fid_val = compute_fid(real_fid, fake_fid)
             print(f"  FID: {fid_val:.2f}")
@@ -389,25 +336,9 @@ def evaluate(args):
         except Exception as e:
             print(f"  FID skipped (tiny-sample backend error): {e}")
 
-        try:
-            real_kid = _repeat_to_min_samples(real_images_np[:num_samples], kid_min_samples)
-            fake_kid = _repeat_to_min_samples(fake_images_np[:num_samples], kid_min_samples)
-            kid_val = compute_kid(real_kid, fake_kid)
-            print(f"  KID: {kid_val:.4f}")
-            wb.log({M.kid(): kid_val})
-        except ImportError as e:
-            print(f"  KID skipped: {e}")
-        except Exception as e:
-            print(f"  KID skipped (tiny-sample backend error): {e}")
-
     wb.log_summary(avg_frame_metrics)
     wb.finish()
     print("\nEvaluation complete.")
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 def parse_args():
@@ -428,9 +359,8 @@ def parse_args():
     parser.add_argument("--full_res", action="store_true",
                         help="Also generate full-resolution 840x420 outputs")
     parser.add_argument("--heavy_metrics", action="store_true",
-                        help="Compute heavy metrics (FID, KID)")
+                        help="Compute heavy metrics (FID)")
 
-    # W&B
     parser.add_argument("--wandb_config", type=str, default="wandb_config.json",
                         help="Path to wandb/eval config JSON")
     parser.add_argument("--run_name", type=str, default=None,
