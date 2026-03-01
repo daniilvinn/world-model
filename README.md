@@ -30,7 +30,9 @@ World/
 ├── precompute_latents.py   # Encode dataset → VQ-VAE latent indices
 ├── play_world_model.py     # AI-driven game (no physics, pure NN)
 ├── quickstart.py           # Workflow guide / next-step checker
-│
+├── wandb_config.json       # Eval cadence, rollout horizons, gradient stats, etc.
+├── TRAIN.MD                # Training guide (CLI, W&B, stages)
+├── EVALUATION.md           # Evaluation guide (metrics, logging, pipeline)
 ├── requirements.txt        # Dependencies
 │
 ├── vqvae/                  # VQ-VAE image compression
@@ -38,20 +40,39 @@ World/
 │   ├── train.py            # Training script
 │   ├── dataset.py          # GameFrameDataset
 │   ├── losses.py           # PerceptualLoss (LPIPS), compute_loss
-│   └── evaluate.py         # Reconstruction grid, codebook stats
+│   └── evaluate.py         # Standalone eval: reconstruction grid, codebook, FID
 │
 ├── dynamics/               # World model (flow matching)
 │   ├── model.py            # DynamicsUNet (conditional U-Net)
 │   ├── train.py            # Training script
 │   ├── dataset.py          # LatentSequenceDataset
-│   └── inference.py        # predict_next_frame, quantize_latent, rollout
+│   ├── inference.py        # predict_next_frame, quantize_latent, rollout
+│   └── evaluate.py         # Standalone eval: one-step, rollouts, FVD, action/failure
+│
+├── evaluation/             # Metrics and evaluation pipeline
+│   ├── config.py           # EvalConfig from wandb_config.json
+│   ├── orchestrator.py     # EvalOrchestrator (epoch eval for VQ-VAE + dynamics)
+│   ├── single_frame_metrics.py  # MSE, MAE, PSNR, SSIM, LPIPS, FID, codebook stats
+│   ├── rollout_metrics.py  # Per-horizon and mean quality (PSNR, SSIM, LPIPS)
+│   ├── temporal_metrics.py # Flicker, optical flow EPE, motion correlation
+│   ├── action_metrics.py   # Controllability score, action success rate
+│   ├── failure_metrics.py  # Collapse rate, time-to-collapse
+│   ├── video_metrics.py    # FVD at multiple clip lengths
+│   ├── runtime_metrics.py  # FPS, frame time, VRAM
+│   ├── _fvd_i3d.py         # I3D / Inception features for FVD
+│   └── _fidelity_helpers.py # FID from in-memory arrays (torch-fidelity)
+│
+├── logger/                 # W&B logging and metric names
+│   ├── wandb_logger.py     # WandbLogger (scalars, images, artifacts, filtering)
+│   ├── metric_names.py     # Central metric name registry (M.*, namespaces)
+│   ├── gradient_stats.py   # Gradient norm/mean/std/max for training
+│   └── architecture.py    # Model architecture JSON for artifacts
 │
 └── (generated at runtime)
     ├── dataset/            # session_YYYYMMDD_HHMMSS/pair_*.npz
     ├── latents/            # session_*.npz, seeds.pt
-    ├── checkpoints/       # vqvae_best.pt, dynamics_best.pt
-    ├── runs/               # TensorBoard logs
-    └── reconstructions/   # VQ-VAE reconstruction grids
+    ├── checkpoints/        # vqvae_best.pt, dynamics_best.pt
+    └── reconstructions/    # VQ-VAE reconstruction grids
 ```
 
 ---
