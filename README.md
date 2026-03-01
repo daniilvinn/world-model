@@ -93,7 +93,7 @@ World/
 | 4 | `python -m dynamics.train` | Train flow-matching model on latent sequences |
 | 5 | `play_world_model.py` | Autoregressive generation: context → dynamics → decode → display |
 
-For a step-by-step training guide with all CLI options, see **[TRAIN.MD](TRAIN.MD)**.
+For a step-by-step training guide with all CLI options, see **[TRAIN.MD](TRAIN.MD)**. For metrics, evaluation cadence, and how evaluation runs during training and standalone, see **[EVALUATION.md](EVALUATION.md)**.
 
 ---
 

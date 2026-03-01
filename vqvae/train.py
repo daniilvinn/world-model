@@ -8,7 +8,7 @@ Usage:
 
 Hyperparameters (plan defaults):
     Optimizer:  AdamW, lr=3e-4, betas=(0.9, 0.95), weight_decay=1e-6
-    Scheduler:  Linear warmup 500 steps, then cosine decay to 1e-5
+    Scheduler:  Linear warmup 5 epochs, then cosine decay to 1e-5
     Batch size: 16
     Epochs:     50 (early stopping, patience=10)
     Mixed prec: FP16 autocast + GradScaler (VQ internals stay float32)
@@ -27,13 +27,19 @@ warnings.filterwarnings('ignore', category=UserWarning, module='torchvision')
 
 import torch
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
 import torchvision.utils as vutils
+from tqdm import tqdm
 
 from vqvae.model import VQVAE
 from vqvae.dataset import create_dataloaders
 from vqvae.losses import PerceptualLoss, compute_loss
+
+from evaluation.config import load_eval_config
+from evaluation.orchestrator import EvalOrchestrator
+from logger.wandb_logger import WandbLogger
+from logger.metric_names import M
+from logger.gradient_stats import compute_gradient_stats
+from logger.architecture import serialize_model_architecture
 
 
 # ---------------------------------------------------------------------------
@@ -41,25 +47,45 @@ from vqvae.losses import PerceptualLoss, compute_loss
 # ---------------------------------------------------------------------------
 
 
-def get_lr_lambda(warmup_steps, total_steps, min_lr, max_lr):
+def build_scheduler(optimizer, warmup_epochs, total_epochs, steps_per_epoch, min_lr):
     """
-    Returns a lambda for torch.optim.lr_scheduler.LambdaLR.
+    Build a built-in scheduler chain: Linear warmup -> Cosine annealing.
+    """
+    steps_per_epoch = max(int(steps_per_epoch), 1)
+    total_steps = max(int(total_epochs) * steps_per_epoch, 1)
+    warmup_steps = max(0, int(warmup_epochs) * steps_per_epoch)
 
-    - Linear warmup from 0 to max_lr over `warmup_steps`.
-    - Cosine decay from max_lr to min_lr over remaining steps.
-    """
-    def lr_lambda(step):
-        if step < warmup_steps:
-            # Linear warmup
-            return step / max(warmup_steps, 1)
-        else:
-            # Cosine decay
-            import math
-            progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-            progress = min(progress, 1.0)
-            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return (min_lr / max_lr) + (1.0 - min_lr / max_lr) * cosine
-    return lr_lambda
+    if warmup_steps <= 0:
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=total_steps,
+            eta_min=min_lr,
+        )
+
+    if warmup_steps >= total_steps:
+        return torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1e-6,
+            end_factor=1.0,
+            total_iters=total_steps,
+        )
+
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=1e-6,
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps - warmup_steps,
+        eta_min=min_lr,
+    )
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[warmup_steps],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -114,13 +140,18 @@ def save_reconstruction_grid(model, val_loader, device, save_path, num_images=8)
         originals.append(batch)
         if sum(b.shape[0] for b in originals) >= num_images:
             break
+    if not originals:
+        model.train()
+        return None
+
     originals = torch.cat(originals, dim=0)[:num_images].to(device)
+    actual_num_images = originals.shape[0]
 
     x_recon, _, _, _ = model(originals)
 
     # Interleave: orig1, recon1, orig2, recon2, ...
     grid_images = []
-    for i in range(num_images):
+    for i in range(actual_num_images):
         grid_images.append(originals[i])
         grid_images.append(x_recon[i])
 
@@ -137,6 +168,7 @@ def save_reconstruction_grid(model, val_loader, device, save_path, num_images=8)
     save_image(grid, save_path)
 
     model.train()
+    return grid
 
 
 # ---------------------------------------------------------------------------
@@ -187,26 +219,61 @@ def train(args):
         weight_decay=args.weight_decay,
     )
 
+    if args.warmup_epochs > args.epochs:
+        raise ValueError(
+            f"warmup_epochs ({args.warmup_epochs}) cannot be greater than epochs ({args.epochs})"
+        )
+
     # Scheduler
-    lr_lambda = get_lr_lambda(
-        warmup_steps=args.warmup_steps,
-        total_steps=total_steps,
+    scheduler = build_scheduler(
+        optimizer=optimizer,
+        warmup_epochs=args.warmup_epochs,
+        total_epochs=args.epochs,
+        steps_per_epoch=steps_per_epoch,
         min_lr=args.min_lr,
-        max_lr=args.lr,
     )
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Mixed precision
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
     if device.type == "cuda":
         print(f"Mixed precision (FP16) enabled - Tensor Cores will be utilized")
 
-    # Tensorboard
-    writer = SummaryWriter(log_dir=args.log_dir)
+    # --- W&B Logger ---
+    eval_config = load_eval_config(args.wandb_config)
+    run_config = {
+        "model": "VQ-VAE",
+        "latent_dim": args.latent_dim,
+        "num_embeddings": args.num_embeddings,
+        "commitment_cost": args.commitment_cost,
+        "ema_decay": args.ema_decay,
+        "lr": args.lr,
+        "min_lr": args.min_lr,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "weight_decay": args.weight_decay,
+        "warmup_epochs": args.warmup_epochs,
+        "patience": args.patience,
+        "eval_config": eval_config.raw,
+    }
+    wb = WandbLogger(
+        config=run_config,
+        run_name=args.run_name,
+        group="VQ-VAE",
+        tags=["vqvae", "training"],
+        enabled=not args.no_wandb,
+        metric_enabled_fn=eval_config.is_metric_enabled,
+    )
+
+    wb.log_architecture(model, "VQ-VAE", extra_metadata={
+        "input_shape": [3, 256, 512],
+        "latent_shape": [args.latent_dim, 32, 32],
+        "num_embeddings": args.num_embeddings,
+    })
+
+    orchestrator = EvalOrchestrator(eval_config, wb, device)
 
     # Checkpointing
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.recon_dir, exist_ok=True)
 
     # Resume from checkpoint
@@ -225,6 +292,10 @@ def train(args):
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         global_step = ckpt.get("global_step", start_epoch * steps_per_epoch)
         print(f"Resumed at epoch {start_epoch}, global_step {global_step}")
+
+    # Gradient stats config (epoch-based logging)
+    grad_enabled = eval_config.gradient_stats_enabled
+    grad_modules = eval_config.gradient_modules("vqvae")
 
     # --------------- Training Loop ---------------
     print(f"\n{'='*60}")
@@ -254,6 +325,7 @@ def train(args):
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -266,16 +338,6 @@ def train(args):
                     epoch_losses[k] = 0.0
                 epoch_losses[k] += v.item()
 
-            # Log every N steps
-            if global_step % args.log_every == 0:
-                current_lr = optimizer.param_groups[0]["lr"]
-                writer.add_scalar("train/total_loss", loss_dict["total"].item(), global_step)
-                writer.add_scalar("train/recon_l1", loss_dict["recon_l1"].item(), global_step)
-                writer.add_scalar("train/perceptual", loss_dict["perceptual"].item(), global_step)
-                writer.add_scalar("train/commitment", loss_dict["commitment"].item(), global_step)
-                writer.add_scalar("train/codebook_usage", usage, global_step)
-                writer.add_scalar("train/lr", current_lr, global_step)
-
             # Update progress bar
             pbar.set_postfix({
                 "loss": f"{loss_dict['total'].item():.4f}",
@@ -286,6 +348,7 @@ def train(args):
         # Epoch summary
         epoch_time = time.time() - epoch_start
         avg_epoch = {k: v / max(len(train_loader), 1) for k, v in epoch_losses.items()}
+        epoch_step = epoch + 1
         print(f"\nEpoch {epoch+1} train (avg) | "
               f"loss: {avg_epoch['total']:.4f} | "
               f"recon: {avg_epoch['recon_l1']:.4f} | "
@@ -293,6 +356,22 @@ def train(args):
               f"commit: {avg_epoch['commitment']:.4f} | "
               f"cb_use: {avg_epoch['codebook_usage']:.2%} | "
               f"time: {epoch_time:.1f}s")
+
+        # W&B train metrics (epoch-based step)
+        current_lr = optimizer.param_groups[0]["lr"]
+        wb.log({
+            M.train_loss("Total"): avg_epoch["total"],
+            M.train_loss("L1 Reconstruction"): avg_epoch["recon_l1"],
+            M.train_loss("LPIPS"): avg_epoch["perceptual"],
+            M.train_loss("Commitment"): avg_epoch["commitment"],
+            M.codebook_usage("Train"): avg_epoch["codebook_usage"],
+            M.learning_rate(): current_lr,
+        }, step=epoch_step, commit=False)
+
+        # Gradient stats are epoch-based to keep all metrics on the same axis.
+        if grad_enabled:
+            grad_stats = compute_gradient_stats(model, grad_modules, model_name="VQ-VAE")
+            wb.log(grad_stats, step=epoch_step, commit=False)
 
         # --------------- Validation ---------------
         val_losses = validate(model, val_loader, perceptual_loss_fn, device)
@@ -303,14 +382,30 @@ def train(args):
               f"commit: {val_losses['commitment']:.4f} | "
               f"cb_use: {val_losses['codebook_usage']:.2%}")
 
-        # Tensorboard val metrics
-        for k, v in val_losses.items():
-            writer.add_scalar(f"val/{k}", v, global_step)
+        # W&B val metrics
+        wb.log({
+            M.val_loss("Total"): val_losses["total"],
+            M.val_loss("L1 Reconstruction"): val_losses["recon_l1"],
+            M.val_loss("LPIPS"): val_losses["perceptual"],
+            M.val_loss("Commitment"): val_losses["commitment"],
+            M.codebook_usage("Val"): val_losses["codebook_usage"],
+        }, step=epoch_step, commit=False)
+
+        # --------------- Evaluation Orchestrator ---------------
+        eval_metrics = orchestrator.run_vqvae_epoch_eval(
+            model, val_loader, epoch_step, epoch_step, commit=False
+        )
 
         # --------------- Reconstruction Grid ---------------
         grid_path = os.path.join(args.recon_dir, f"recon_epoch_{epoch+1:03d}.png")
-        save_reconstruction_grid(model, val_loader, device, grid_path, num_images=8)
-        print(f"Saved reconstruction grid to {grid_path}")
+        grid = save_reconstruction_grid(model, val_loader, device, grid_path, num_images=8)
+        if grid is not None:
+            print(f"Saved reconstruction grid to {grid_path}")
+            wb.log_image("Evaluation/Reconstruction Grid", grid_path, step=epoch_step, commit=True)
+        else:
+            print("Skipped reconstruction grid (validation loader is empty)")
+            # Always finalize the W&B step once per epoch.
+            wb.log({M.learning_rate(): current_lr}, step=epoch_step, commit=True)
 
         # --------------- Checkpointing ---------------
         checkpoint = {
@@ -335,6 +430,8 @@ def train(args):
         # Save latest
         latest_path = os.path.join(args.checkpoint_dir, "vqvae_latest.pt")
         torch.save(checkpoint, latest_path)
+        if eval_config.log_latest_checkpoint:
+            wb.log_checkpoint(latest_path, "vqvae-latest", metadata={"epoch": epoch, "val_loss": val_losses["total"]})
 
         # Save best
         val_total = val_losses["total"]
@@ -345,6 +442,8 @@ def train(args):
             checkpoint["best_val_loss"] = best_val_loss
             torch.save(checkpoint, best_path)
             print(f"New best model! val_loss={val_total:.4f}")
+            if eval_config.log_best_checkpoint:
+                wb.log_checkpoint(best_path, "vqvae-best", metadata={"epoch": epoch, "val_loss": val_total})
         else:
             patience_counter += 1
             print(f"No improvement ({patience_counter}/{args.patience})")
@@ -357,7 +456,8 @@ def train(args):
 
         print()
 
-    writer.close()
+    wb.log_summary({"best_val_loss": best_val_loss})
+    wb.finish()
     print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
     print(f"Best model saved to: {os.path.join(args.checkpoint_dir, 'vqvae_best.pt')}")
 
@@ -399,20 +499,26 @@ def parse_args():
                         help="Minimum learning rate (end of cosine decay)")
     parser.add_argument("--weight_decay", type=float, default=1e-6,
                         help="AdamW weight decay")
-    parser.add_argument("--warmup_steps", type=int, default=500,
-                        help="Linear warmup steps")
-    parser.add_argument("--patience", type=int, default=10,
+    parser.add_argument("--warmup_epochs", type=int, default=5,
+                        help="Linear warmup epochs")
+    parser.add_argument("--patience", type=int, default=1000,
                         help="Early stopping patience (epochs)")
 
     # Logging
     parser.add_argument("--log_every", type=int, default=50,
-                        help="Log to tensorboard every N steps")
-    parser.add_argument("--log_dir", type=str, default="runs/vqvae",
-                        help="TensorBoard log directory")
+                        help="Log to W&B every N steps")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints",
                         help="Checkpoint save directory")
     parser.add_argument("--recon_dir", type=str, default="reconstructions",
                         help="Reconstruction grid save directory")
+
+    # W&B
+    parser.add_argument("--wandb_config", type=str, default="wandb_config.json",
+                        help="Path to wandb/eval config JSON")
+    parser.add_argument("--run_name", type=str, default=None,
+                        help="W&B run name override")
+    parser.add_argument("--no_wandb", action="store_true",
+                        help="Disable W&B logging")
 
     # Resume
     parser.add_argument("--resume", type=str, default=None,

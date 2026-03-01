@@ -123,6 +123,17 @@ def create_dataloaders(
     val_size = int(total * val_split)
     train_size = total - val_size
 
+    # For tiny smoke-test datasets (e.g. max_samples=4), int(total*val_split)
+    # can become 0 and break validation logging downstream. Keep at least one
+    # sample in each split whenever the dataset has at least 2 samples.
+    if total >= 2:
+        if val_size == 0 and val_split > 0:
+            val_size = 1
+            train_size = total - val_size
+        elif train_size == 0 and val_size > 0:
+            train_size = 1
+            val_size = total - train_size
+
     # Reproducible split
     generator = torch.Generator().manual_seed(seed)
     train_dataset, val_dataset = random_split(
@@ -131,6 +142,8 @@ def create_dataloaders(
 
     print(f"Split: {train_size} train, {val_size} val")
 
+    train_drop_last = len(train_dataset) >= batch_size
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -138,7 +151,7 @@ def create_dataloaders(
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=num_workers > 0,
-        drop_last=True,
+        drop_last=train_drop_last,
     )
 
     val_loader = DataLoader(
