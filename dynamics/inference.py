@@ -42,17 +42,7 @@ def _align_context_length(context_zq, expected_context_length):
 
 def quantize_latent(z, codebook):
     """
-    Quantize continuous latent through VQ-VAE codebook (nearest-neighbor lookup).
-    
-    This is critical for autoregressive generation: the dynamics model was trained
-    on quantized latents (codebook vectors), so its outputs must be quantized before
-    being fed back as context to keep the autoregressive loop in-distribution.
-    
-    Without this step, small deviations from codebook vectors accumulate over
-    autoregressive steps, causing:
-      - Mode collapse to flat terrain (most common training pattern)
-      - Loss of action responsiveness (OOD context drowns out action signal)
-      - Visual artifacts (VQ-VAE decoder receives off-codebook inputs)
+    Legacy utility: nearest-neighbor quantization through VQ-VAE codebook.
     
     Args:
         z: [B, C, H, W] continuous latent from ODE integration
@@ -75,6 +65,27 @@ def quantize_latent(z, codebook):
     indices = distances.argmin(dim=1)  # [BHW]
     z_q = cb[indices].reshape(B, H, W, C).permute(0, 3, 1, 2)
     return z_q
+
+
+def _sample_indices_from_logits(logits, temperature=1.0):
+    """
+    Sample discrete token indices from logits.
+
+    Args:
+        logits: [B, K, H, W]
+        temperature: >0 for stochastic sampling, <=0 for argmax
+
+    Returns:
+        indices: [B, H, W] long
+    """
+    if temperature <= 0:
+        return logits.argmax(dim=1)
+
+    probs = torch.softmax(logits / temperature, dim=1)
+    B, K, H, W = probs.shape
+    probs_flat = probs.permute(0, 2, 3, 1).reshape(-1, K)
+    sampled = torch.multinomial(probs_flat, num_samples=1).squeeze(1)
+    return sampled.view(B, H, W)
 
 
 def apply_context_noise(context_zq, noise_levels):
@@ -119,6 +130,7 @@ def predict_next_frame(
     solver="euler",
     device="cuda",
     codebook=None,
+    temperature=1.0,
     context_noise_levels=None,
 ):
     """
@@ -131,15 +143,18 @@ def predict_next_frame(
         num_steps: number of ODE integration steps (more = better quality)
         solver: "euler" or "midpoint"
         device: torch device
-        codebook: [K, C] VQ-VAE codebook for post-ODE quantization (strongly recommended
-                  for autoregressive use; keeps outputs in-distribution with training data)
+        codebook: [K, C] VQ-VAE codebook embeddings (required)
+        temperature: sampling temperature for final token sampling (>0 stochastic, <=0 argmax)
         context_noise_levels: None, scalar, [ctx_len], or [B, ctx_len] noise levels in [0, 1]
     
     Returns:
-        z_next: [1, 16, 32, 32] predicted next latent frame (quantized if codebook provided)
+        z_next: [B, 16, 32, 32] predicted next latent frame (embedded from sampled indices)
+        indices: [B, 32, 32] sampled token indices
     """
     if context_zq.dim() != 5:
         raise ValueError(f"context_zq must be [B, ctx_len, C, H, W], got shape {tuple(context_zq.shape)}")
+    if codebook is None:
+        raise ValueError("codebook is required for logits->embedding conversion during inference")
 
     # Match runtime context length to training-time model expectation.
     expected_ctx_len = _get_model_attr(model, "context_length", None)
@@ -162,16 +177,21 @@ def predict_next_frame(
     else:
         action_tensor = torch.full((B,), int(action), device=device, dtype=torch.long)
     
-    # Start from pure noise
+    # Start from pure Gaussian noise (same as training interpolation anchor)
     x = torch.randn(B, C, H, W, device=device)
+    codebook = codebook.to(device=device, dtype=x.dtype)
     
     dt = 1.0 / num_steps
     
     if solver == "euler":
-        # Euler method (1st-order)
+        # Euler method (1st-order), x0-prediction converted to velocity.
         for i in range(num_steps):
             t = torch.full((B,), i * dt, device=device)
-            v = model(x, t, context_flat, action_tensor)
+            logits = model(x, t, context_flat, action_tensor)
+            probs = torch.softmax(logits, dim=1)
+            x1_hat = torch.einsum("bkhw,kc->bchw", probs, codebook)
+            denom = (1.0 - t[:, None, None, None]).clamp(min=1e-5)
+            v = (x1_hat - x) / denom
             x = x + v * dt
     
     elif solver == "midpoint":
@@ -180,14 +200,20 @@ def predict_next_frame(
             t = torch.full((B,), i * dt, device=device)
             t_mid = torch.full((B,), i * dt + 0.5 * dt, device=device)
             
-            # First velocity at current point
-            v1 = model(x, t, context_flat, action_tensor)
+            logits1 = model(x, t, context_flat, action_tensor)
+            probs1 = torch.softmax(logits1, dim=1)
+            x1_hat_1 = torch.einsum("bkhw,kc->bchw", probs1, codebook)
+            denom1 = (1.0 - t[:, None, None, None]).clamp(min=1e-5)
+            v1 = (x1_hat_1 - x) / denom1
             
             # Midpoint
             x_mid = x + v1 * 0.5 * dt
             
-            # Velocity at midpoint
-            v2 = model(x_mid, t_mid, context_flat, action_tensor)
+            logits2 = model(x_mid, t_mid, context_flat, action_tensor)
+            probs2 = torch.softmax(logits2, dim=1)
+            x1_hat_2 = torch.einsum("bkhw,kc->bchw", probs2, codebook)
+            denom2 = (1.0 - t_mid[:, None, None, None]).clamp(min=1e-5)
+            v2 = (x1_hat_2 - x_mid) / denom2
             
             # Full step using midpoint velocity
             x = x + v2 * dt
@@ -195,11 +221,13 @@ def predict_next_frame(
     else:
         raise ValueError(f"Unknown solver: {solver}. Use 'euler' or 'midpoint'.")
     
-    # Quantize through VQ-VAE codebook to stay in-distribution for autoregressive use
-    if codebook is not None:
-        x = quantize_latent(x, codebook)
+    # Sample final tokens from logits at t=1, then map back to codebook embeddings.
+    t_final = torch.full((B,), 1.0 - 1e-4, device=device)
+    logits_final = model(x, t_final, context_flat, action_tensor)
+    indices = _sample_indices_from_logits(logits_final, temperature=temperature)
+    z_q = codebook[indices].permute(0, 3, 1, 2)
     
-    return x  # predicted z_{t+1}
+    return z_q, indices
 
 
 @torch.no_grad()
@@ -211,6 +239,7 @@ def rollout(
     solver="euler",
     device="cuda",
     codebook=None,
+    temperature=1.0,
     context_noise_levels=None,
     context_noise_schedule=None,
 ):
@@ -224,7 +253,8 @@ def rollout(
         num_ode_steps: ODE integration steps per frame
         solver: "euler" or "midpoint"
         device: torch device
-        codebook: [K, C] VQ-VAE codebook for post-ODE quantization (strongly recommended)
+        codebook: [K, C] VQ-VAE codebook embeddings (required)
+        temperature: sampling temperature for logits (>0 stochastic, <=0 argmax)
         context_noise_levels: None, scalar, [ctx_len], or [B, ctx_len] noise levels in [0, 1]
         context_noise_schedule: optional list of noise_levels per rollout step (len = actions)
     
@@ -241,7 +271,7 @@ def rollout(
                 raise ValueError("context_noise_schedule length must match actions length.")
             step_noise_levels = context_noise_schedule[step_idx]
 
-        z_next = predict_next_frame(
+        z_next, _ = predict_next_frame(
             model,
             context,
             action,
@@ -249,6 +279,7 @@ def rollout(
             solver,
             device,
             codebook,
+            temperature=temperature,
             context_noise_levels=step_noise_levels,
         )
         generated.append(z_next)

@@ -20,17 +20,13 @@ class LatentSequenceDataset(Dataset):
         latents_dir: Directory containing session_*.npz files with precomputed latents
         context_length: Number of context frames (default 4)
         rollout_length: Number of target frames to predict (default 1)
-        codebook: VQ-VAE codebook tensor [num_embeddings, embedding_dim] for index->z_q lookup
+        codebook: Unused (kept for compatibility with existing callsites)
     """
     
     def __init__(self, latents_dir="latents", context_length=4, rollout_length=1, codebook=None):
         super().__init__()
         self.context_length = context_length
         self.rollout_length = rollout_length
-        self.codebook = codebook
-        
-        if codebook is None:
-            raise ValueError("codebook must be provided (vqvae.quantizer.embedding)")
         
         # Load all session files
         session_files = sorted(glob.glob(os.path.join(latents_dir, "session_*.npz")))
@@ -82,8 +78,8 @@ class LatentSequenceDataset(Dataset):
     def __getitem__(self, idx):
         """
         Returns:
-            context_zq: [context_length, 16, 32, 32] float32 - context frames as continuous latents
-            targets_zq: [rollout_length, 16, 32, 32] float32 - target frames as continuous latents
+            context_indices: [context_length, 32, 32] int64 - context token indices
+            target_indices: [rollout_length, 32, 32] int64 - target token indices
             actions: [rollout_length] int - actions for each transition
         """
         session_idx, start_idx = self.windows[idx]
@@ -101,22 +97,14 @@ class LatentSequenceDataset(Dataset):
         action_start_idx = start_idx + self.context_length - 1
         actions = session['actions'][action_start_idx:action_start_idx + self.rollout_length]  # [rollout_len]
         
-        # Convert indices to continuous latents via codebook lookup
+        # Convert indices to tensors
         context_indices_tensor = torch.from_numpy(context_indices).long()  # [ctx_len, 32, 32]
         target_indices_tensor = torch.from_numpy(target_indices).long()  # [rollout_len, 32, 32]
-        
-        # Codebook lookup: [ctx_len, 32, 32] -> [ctx_len, 32, 32, 16]
-        context_zq = self.codebook[context_indices_tensor]  # [ctx_len, 32, 32, 16]
-        context_zq = context_zq.permute(0, 3, 1, 2)  # [ctx_len, 16, 32, 32]
-        
-        # Codebook lookup: [rollout_len, 32, 32] -> [rollout_len, 32, 32, 16]
-        targets_zq = self.codebook[target_indices_tensor]  # [rollout_len, 32, 32, 16]
-        targets_zq = targets_zq.permute(0, 3, 1, 2)  # [rollout_len, 16, 32, 32]
         
         # Convert actions to tensor
         actions_tensor = torch.from_numpy(actions).long()  # [rollout_len]
         
-        return context_zq.float(), targets_zq.float(), actions_tensor
+        return context_indices_tensor, target_indices_tensor, actions_tensor
 
 
 def create_dataloaders(

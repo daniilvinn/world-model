@@ -38,6 +38,7 @@ class WorldModelGame:
         seed_index=None,
         display_size=(840, 420),
         solver="euler",
+        temperature=1.0,
         compile_models=True,
     ):
         """
@@ -53,6 +54,7 @@ class WorldModelGame:
         """
         self.ode_steps = ode_steps
         self.solver = solver
+        self.temperature = temperature
         self.display_size = display_size
         
         # Set up PyTorch
@@ -132,7 +134,8 @@ class WorldModelGame:
         
         model = DynamicsUNet(
             in_channels=16 + 16 * config.get("context_length", 4),
-            out_channels=16,
+            num_embeddings=config.get("num_embeddings", 1024),
+            bottleneck_dim=config.get("bottleneck_dim", 64),
             base_channels=config.get("base_channels", 128),
             channel_mults=tuple(config.get("channel_mults", [1, 2, 2])),
             cond_dim=config.get("cond_dim", 256),
@@ -173,6 +176,7 @@ class WorldModelGame:
             solver=self.solver,
             device=self.device,
             codebook=self.codebook,
+            temperature=self.temperature,
         )
     
     def _decode_to_pixels(self, z):
@@ -248,7 +252,7 @@ class WorldModelGame:
             action = 1 if keys[pygame.K_SPACE] else 0
             
             # ---- 2. Dynamics Model: predict next latent ----
-            z_next = self._predict_next(action)  # [1, 16, 32, 32]
+            z_next, _ = self._predict_next(action)  # [1, 16, 32, 32], [1, 32, 32]
             
             # ---- 3. VQ-VAE Decode: latent -> pixels ----
             pixels = self._decode_to_pixels(z_next)  # numpy (840, 420, 3) uint8
@@ -283,6 +287,8 @@ def main():
                         help="ODE integration steps (more = better quality, slower)")
     parser.add_argument("--solver", type=str, default="euler", choices=["euler", "midpoint"],
                         help="ODE solver (midpoint is 2x slower but more accurate)")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Sampling temperature for dynamics logits (>0 stochastic, <=0 argmax)")
     parser.add_argument("--seed_index", type=int, default=None,
                         help="Specific seed index (default: random)")
     parser.add_argument("--width", type=int, default=840,
@@ -312,6 +318,7 @@ def main():
         seed_index=args.seed_index,
         display_size=(args.width, args.height),
         solver=args.solver,
+        temperature=args.temperature,
         compile_models=not args.no_compile,
     )
     

@@ -26,7 +26,8 @@ def _load_dynamics(checkpoint_path, device):
     cfg = ckpt.get("config", {})
     model = DynamicsUNet(
         in_channels=16 + 16 * cfg.get("context_length", 4),
-        out_channels=16,
+        num_embeddings=cfg.get("num_embeddings", 1024),
+        bottleneck_dim=cfg.get("bottleneck_dim", 64),
         base_channels=cfg.get("base_channels", 128),
         channel_mults=tuple(cfg.get("channel_mults", [1, 2, 2])),
         cond_dim=cfg.get("cond_dim", 256),
@@ -104,22 +105,26 @@ def evaluate(args):
     num_batches = 0
 
     for batch in tqdm(val_loader, desc="One-step eval"):
-        context_zq, targets_zq, actions = batch
-        context_zq = context_zq.to(device)
-        targets_zq = targets_zq.to(device)
+        context_indices, targets_indices, actions = batch
+        context_indices = context_indices.to(device)
+        targets_indices = targets_indices.to(device)
         actions = actions.to(device)
 
-        target_zq = targets_zq[:, 0] if targets_zq.dim() == 5 else targets_zq
+        target_indices = targets_indices[:, 0] if targets_indices.dim() == 4 else targets_indices
         action = actions[:, 0] if actions.dim() == 2 else actions
+        context_zq = codebook[context_indices].permute(0, 1, 4, 2, 3)
 
         with torch.no_grad():
-            pred_zq = predict_next_frame(
+            pred_zq, pred_indices = predict_next_frame(
                 dynamics_model, context_zq[:1], action[0].item(),
-                num_steps=args.eval_ode_steps, device=device, codebook=codebook,
+                num_steps=args.eval_ode_steps,
+                device=device,
+                codebook=codebook,
+                temperature=args.temperature,
             )
 
-        gt_decoded = vqvae_model.decode(target_zq[:1])
-        pred_decoded = vqvae_model.decode(pred_zq[:1])
+        gt_decoded = vqvae_model.decode_indices(target_indices[:1])
+        pred_decoded = vqvae_model.decode_indices(pred_indices[:1])
 
         metrics = evaluate_single_frame(pred_decoded, gt_decoded)
         for k, v in metrics.items():
@@ -145,17 +150,19 @@ def evaluate(args):
     count = 0
 
     for batch in tqdm(val_loader, desc="Rollout generation"):
-        context_zq, targets_zq, actions = batch
-        context_zq = context_zq.to(device)
-        targets_zq = targets_zq.to(device)
+        context_indices, targets_indices, actions = batch
+        context_indices = context_indices.to(device)
+        targets_indices = targets_indices.to(device)
         actions = actions.to(device)
+        context_zq = codebook[context_indices].permute(0, 1, 4, 2, 3)
+        targets_zq = codebook[targets_indices].permute(0, 1, 4, 2, 3)
 
         B = context_zq.shape[0]
         for b in range(B):
             if count >= args.num_eval_sequences:
                 break
 
-            action_seq_len = min(max_h, targets_zq.shape[1] if targets_zq.dim() == 5 else 1)
+            action_seq_len = min(max_h, targets_indices.shape[1] if targets_indices.dim() == 4 else 1)
             action_seq = actions[b, :action_seq_len].cpu().tolist() if actions.dim() == 2 else [actions[b].item()]
             if len(action_seq) < max_h:
                 action_seq = action_seq * (max_h // max(len(action_seq), 1) + 1)
@@ -166,7 +173,9 @@ def evaluate(args):
                     dynamics_model, context_zq[b:b+1],
                     action_seq[:max_h],
                     num_ode_steps=args.eval_ode_steps,
-                    device=device, codebook=codebook,
+                    device=device,
+                    codebook=codebook,
+                    temperature=args.temperature,
                 )
 
             rollout_batch.append(gen_frames)
@@ -245,7 +254,10 @@ def evaluate(args):
             with torch.no_grad():
                 predict_next_frame(
                     dynamics_model, test_context, 0,
-                    num_steps=args.eval_ode_steps, device=device, codebook=codebook,
+                    num_steps=args.eval_ode_steps,
+                    device=device,
+                    codebook=codebook,
+                    temperature=args.temperature,
                 )
             profiler.tick()
         runtime_results = profiler.finish()
@@ -268,6 +280,8 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--eval_ode_steps", type=int, default=10,
                         help="ODE integration steps used in evaluation")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Sampling temperature for token logits (>0 stochastic, <=0 argmax)")
     parser.add_argument("--eval_chunk_size", type=int, default=16,
                         help="Chunk size for decode-heavy eval steps (reserved for parity with training CLI)")
     parser.add_argument("--num_eval_sequences", type=int, default=20,

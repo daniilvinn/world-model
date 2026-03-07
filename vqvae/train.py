@@ -473,7 +473,7 @@ def parse_args():
     # Data
     parser.add_argument("--data_dir", type=str, default="dataset",
                         help="Directory containing session_*/pair_*.npz files")
-    parser.add_argument("--num_workers", type=int, default=4,
+    parser.add_argument("--num_workers", type=int, default=8,
                         help="DataLoader num_workers")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Maximum number of samples to use from dataset (None = use all)")

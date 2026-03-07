@@ -1,15 +1,13 @@
 """
-Dynamics model: conditional U-Net for flow matching on VQ-VAE latents.
+Dynamics model: conditional U-Net for token-logit flow matching on VQ-VAE latents.
 
 Architecture:
     - Input: noisy target latent [16, 32, 32] + context frames [64, 32, 32] = [80, 32, 32]
     - Conditioning: flow time (sinusoidal embedding) + action (embedding)
-    - Output: velocity field [16, 32, 32]
-    
+    - Output: token logits [K, 32, 32], where K = num codebook entries
+
     Spatial: 32x32 -> 16x16 -> 8x8 -> 16x16 -> 32x32
     Channels: 128 -> 256 -> 256 -> 256 -> 128
-    
-    ~5-6M parameters
 """
 
 import math
@@ -209,7 +207,7 @@ class DynamicsUNet(nn.Module):
     Small U-Net for flow matching on 32x32 VQ-VAE latents.
     
     Input channels: 16 (noisy target) + 16*context_length (context frames) = 80 (for context_length=4)
-    Output channels: 16 (predicted velocity)
+    Output channels: num_embeddings (token logits)
     
     Spatial path: 32x32 -> 16x16 -> 8x8 -> 16x16 -> 32x32
     Channel path:  128  ->  256  -> 256 ->  256  ->  128
@@ -223,7 +221,8 @@ class DynamicsUNet(nn.Module):
     def __init__(
         self,
         in_channels=80,
-        out_channels=16,
+        num_embeddings=1024,
+        bottleneck_dim=64,
         base_channels=128,
         channel_mults=(1, 2, 2),
         cond_dim=256,
@@ -233,7 +232,8 @@ class DynamicsUNet(nn.Module):
     ):
         super().__init__()
         self.in_channels = in_channels
-        self.out_channels = out_channels
+        self.num_embeddings = num_embeddings
+        self.bottleneck_dim = bottleneck_dim
         self.context_length = context_length
         
         # Conditioning network
@@ -315,7 +315,8 @@ class DynamicsUNet(nn.Module):
         # Output convolution
         self.norm_out = nn.GroupNorm(32, base_channels)
         self.act_out = nn.SiLU()
-        self.conv_out = nn.Conv2d(base_channels, out_channels, kernel_size=3, padding=1)
+        self.conv_out = nn.Conv2d(base_channels, bottleneck_dim, kernel_size=3, padding=1)
+        self.logit_proj = nn.Conv2d(bottleneck_dim, num_embeddings, kernel_size=1)
     
     def forward(self, x_t, t, context, action):
         """
@@ -326,7 +327,7 @@ class DynamicsUNet(nn.Module):
             action:  [B] int action index (0 or 1)
         
         Returns:
-            v:       [B, 16, 32, 32] predicted velocity field
+            logits:  [B, K, 32, 32] token logits over codebook entries
         """
         # Get conditioning vector
         cond = self.cond_net(t, action)  # [B, cond_dim]
@@ -376,6 +377,7 @@ class DynamicsUNet(nn.Module):
         
         # Output
         h = self.act_out(self.norm_out(h))
-        v = self.conv_out(h)  # [B, out_channels, 32, 32]
+        h = self.conv_out(h)  # [B, bottleneck_dim, 32, 32]
+        logits = self.logit_proj(h)  # [B, num_embeddings, 32, 32]
         
-        return v
+        return logits

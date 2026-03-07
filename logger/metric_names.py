@@ -29,6 +29,14 @@ class M:
         return f"{Namespace.OPTIMIZATION}/Codebook Usage ({split})"
 
     @staticmethod
+    def train_perplexity() -> str:
+        return f"{Namespace.OPTIMIZATION}/Train Perplexity"
+
+    @staticmethod
+    def val_perplexity() -> str:
+        return f"{Namespace.OPTIMIZATION}/Val Perplexity"
+
+    @staticmethod
     def scheduled_sampling_prob() -> str:
         return f"{Namespace.OPTIMIZATION}/Scheduled Sampling Probability"
 

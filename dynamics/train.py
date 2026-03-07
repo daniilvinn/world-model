@@ -1,6 +1,7 @@
 """Training script for the dynamics model."""
 
 import argparse
+import math
 import os
 import time
 import warnings
@@ -104,12 +105,43 @@ def build_scheduler(optimizer, warmup_epochs, total_epochs, steps_per_epoch, min
     )
 
 
-def training_step(model, context_zq, target_zq, action, diffusion_forcing=True, max_context_noise=0.2):
+def _indices_to_embeddings(indices, codebook):
+    """
+    Convert token indices to codebook embeddings.
+
+    Args:
+        indices: [B, H, W] or [B, T, H, W] long
+        codebook: [K, C]
+
+    Returns:
+        [B, C, H, W] or [B, T, C, H, W] float
+    """
+    if indices.dim() == 3:
+        # [B, H, W] -> [B, H, W, C] -> [B, C, H, W]
+        return codebook[indices].permute(0, 3, 1, 2)
+    if indices.dim() == 4:
+        # [B, T, H, W] -> [B, T, H, W, C] -> [B, T, C, H, W]
+        return codebook[indices].permute(0, 1, 4, 2, 3)
+    raise ValueError(f"indices must be [B,H,W] or [B,T,H,W], got shape {tuple(indices.shape)}")
+
+
+def training_step(
+    model,
+    context_indices,
+    target_indices,
+    action,
+    codebook,
+    diffusion_forcing=True,
+    max_context_noise=0.2,
+):
     """
     Flow matching training step with optional diffusion forcing.
     """
-    B = target_zq.shape[0]
-    device = target_zq.device
+    B = target_indices.shape[0]
+    device = target_indices.device
+
+    context_zq = _indices_to_embeddings(context_indices, codebook)  # [B, ctx_len, 16, 32, 32]
+    target_zq = _indices_to_embeddings(target_indices, codebook)  # [B, 16, 32, 32]
     
     if diffusion_forcing and model.training:
         if torch.rand(1).item() < 0.5:
@@ -127,44 +159,50 @@ def training_step(model, context_zq, target_zq, action, diffusion_forcing=True, 
     t_expand = t[:, None, None, None]
     x_t = (1 - t_expand) * x_0 + t_expand * x_1
     
-    u_t = x_1 - x_0
-    
-    v_pred = model(x_t, t, context_flat, action)
-    
-    loss = F.mse_loss(v_pred, u_t)
+    logits = model(x_t, t, context_flat, action)
+    loss = F.cross_entropy(logits, target_indices)
     
     return loss
 
 
 def rollout_training_step(
-    model, context_zq, targets_zq, actions, p_ss=0.5,
-    rollout_ode_steps=3, codebook=None,
-    diffusion_forcing=True, max_context_noise=0.2
+    model,
+    context_indices,
+    targets_indices,
+    actions,
+    codebook,
+    p_ss=0.5,
+    temperature=1.0,
+    rollout_ode_steps=4,
+    diffusion_forcing=True,
+    max_context_noise=0.2,
 ):
     """
     Multi-step rollout training with scheduled sampling.
     """
     B, rollout_length = actions.shape
-    device = targets_zq.device
+    device = targets_indices.device
     
-    current_context = context_zq.clone()
+    current_context_indices = context_indices.clone()
     
     total_loss = 0.0
     
     for step in range(rollout_length):
         if diffusion_forcing and model.training:
             if torch.rand(1).item() < 0.5:
+                current_context = _indices_to_embeddings(current_context_indices, codebook)
                 noise_levels = torch.rand(B, current_context.shape[1], 1, 1, 1, device=device) * max_context_noise
                 noise = torch.randn_like(current_context)
                 step_context = (1 - noise_levels) * current_context + noise_levels * noise
             else:
-                step_context = current_context
+                step_context = _indices_to_embeddings(current_context_indices, codebook)
         else:
-            step_context = current_context
+            step_context = _indices_to_embeddings(current_context_indices, codebook)
         
         context_flat = step_context.reshape(B, -1, 32, 32)
         
-        target_zq = targets_zq[:, step]
+        target_indices = targets_indices[:, step]
+        target_zq = _indices_to_embeddings(target_indices, codebook)
         action = actions[:, step]
         
         x_0 = torch.randn_like(target_zq)
@@ -175,41 +213,45 @@ def rollout_training_step(
         t_expand = t[:, None, None, None]
         x_t = (1 - t_expand) * x_0 + t_expand * x_1
         
-        u_t = x_1 - x_0
-        
-        v_pred = model(x_t, t, context_flat, action)
-        
-        step_loss = F.mse_loss(v_pred, u_t)
+        logits = model(x_t, t, context_flat, action)
+        step_loss = F.cross_entropy(logits, target_indices)
         total_loss += step_loss
         
         if step < rollout_length - 1:
             with torch.no_grad():
                 x = torch.randn_like(target_zq)
-                
-                dt = 1.0 / rollout_ode_steps
-                
-                for i in range(rollout_ode_steps):
-                    t_ode = torch.full((B,), i * dt, device=device)
-                    v = model(x, t_ode, context_flat, action)
-                    x = x + v * dt
-                
-                if codebook is not None:
-                    from dynamics.inference import quantize_latent
-                    x = quantize_latent(x, codebook)
-                
-                predicted_frame = x
+                ss_dt = 1.0 / rollout_ode_steps
+                for ode_i in range(rollout_ode_steps):
+                    t_ode = torch.full((B,), ode_i * ss_dt, device=device)
+                    logits_ode = model(x, t_ode, context_flat, action)
+                    probs_ode = torch.softmax(logits_ode, dim=1)
+                    x1_hat = torch.einsum("bkhw,kc->bchw", probs_ode, codebook)
+                    denom = (1.0 - t_ode[:, None, None, None]).clamp(min=1e-5)
+                    v = (x1_hat - x) / denom
+                    x = x + v * ss_dt
+
+                t_final = torch.full((B,), 1.0 - 1e-4, device=device)
+                pred_logits = model(x, t_final, context_flat, action)
+
+                if temperature > 0:
+                    probs = torch.softmax(pred_logits / temperature, dim=1)
+                    Bp, K, H, W = probs.shape
+                    probs_flat = probs.permute(0, 2, 3, 1).reshape(-1, K)
+                    predicted_indices = torch.multinomial(probs_flat, num_samples=1).squeeze(1).view(Bp, H, W)
+                else:
+                    predicted_indices = pred_logits.argmax(dim=1)
             
             use_prediction = torch.rand(B, device=device) < p_ss
-            
-            next_frame = torch.where(
-                use_prediction[:, None, None, None],
-                predicted_frame,
-                targets_zq[:, step]
+
+            next_frame_indices = torch.where(
+                use_prediction[:, None, None],
+                predicted_indices,
+                targets_indices[:, step]
             )
-            
-            current_context = torch.cat([
-                current_context[:, 1:],
-                next_frame.unsqueeze(1)
+
+            current_context_indices = torch.cat([
+                current_context_indices[:, 1:],
+                next_frame_indices.unsqueeze(1)
             ], dim=1)
     
     avg_loss = total_loss / rollout_length
@@ -219,7 +261,8 @@ def rollout_training_step(
 
 @torch.no_grad()
 def validate(model, val_loader, device, rollout_length=1,
-             rollout_ode_steps=3, codebook=None, diffusion_forcing=True, max_context_noise=0.2):
+             codebook=None, temperature=1.0, rollout_ode_steps=4,
+             diffusion_forcing=True, max_context_noise=0.2):
     """
     Run validation and return average loss.
     """
@@ -228,21 +271,33 @@ def validate(model, val_loader, device, rollout_length=1,
     num_batches = 0
     
     for batch in val_loader:
-        context_zq, targets_zq, actions = batch
-        context_zq = context_zq.to(device)
-        targets_zq = targets_zq.to(device)
+        context_indices, targets_indices, actions = batch
+        context_indices = context_indices.to(device)
+        targets_indices = targets_indices.to(device)
         actions = actions.to(device)
         
         if rollout_length == 1:
-            target_zq = targets_zq[:, 0] if targets_zq.dim() == 5 else targets_zq
+            target_indices = targets_indices[:, 0] if targets_indices.dim() == 4 else targets_indices
             action = actions[:, 0] if actions.dim() == 2 else actions
-            loss = training_step(model, context_zq, target_zq, action, diffusion_forcing, max_context_noise)
+            loss = training_step(
+                model,
+                context_indices,
+                target_indices,
+                action,
+                codebook,
+                diffusion_forcing,
+                max_context_noise,
+            )
         else:
             loss = rollout_training_step(
-                model, context_zq, targets_zq, actions,
-                p_ss=0.0,
-                rollout_ode_steps=rollout_ode_steps,
+                model,
+                context_indices,
+                targets_indices,
+                actions,
                 codebook=codebook,
+                p_ss=0.0,
+                temperature=temperature,
+                rollout_ode_steps=rollout_ode_steps,
                 diffusion_forcing=diffusion_forcing,
                 max_context_noise=max_context_noise
             )
@@ -275,7 +330,7 @@ def train(args):
         max_samples=args.max_samples,
     )
     
-    codebook = codebook.to(device)
+    codebook = codebook.detach().to(device)
     
     steps_per_epoch = len(train_loader)
     total_steps = steps_per_epoch * args.epochs
@@ -285,7 +340,8 @@ def train(args):
     # Model
     model = DynamicsUNet(
         in_channels=16 + 16 * args.context_length,
-        out_channels=16,
+        num_embeddings=args.num_embeddings,
+        bottleneck_dim=args.bottleneck_dim,
         base_channels=args.base_channels,
         channel_mults=tuple(args.channel_mults),
         cond_dim=args.cond_dim,
@@ -336,6 +392,9 @@ def train(args):
         "cond_dim": args.cond_dim,
         "num_actions": args.num_actions,
         "attn_resolution": args.attn_resolution,
+        "num_embeddings": args.num_embeddings,
+        "bottleneck_dim": args.bottleneck_dim,
+        "temperature": args.temperature,
         "lr": args.lr,
         "min_lr": args.min_lr,
         "batch_size": args.batch_size,
@@ -368,7 +427,8 @@ def train(args):
 
     wb.log_architecture(model, "Dynamics UNet", extra_metadata={
         "in_channels": 16 + 16 * args.context_length,
-        "out_channels": 16,
+        "out_channels": args.num_embeddings,
+        "bottleneck_dim": args.bottleneck_dim,
         "spatial_path": "32x32 -> 16x16 -> 8x8 -> 16x16 -> 32x32",
         "num_actions": args.num_actions,
     })
@@ -455,26 +515,27 @@ def train(args):
         ) if args.rollout_length > 1 else 0.0
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
-        for batch_idx, (context_zq, targets_zq, actions) in enumerate(pbar):
-            context_zq = context_zq.to(device, non_blocking=True)
-            targets_zq = targets_zq.to(device, non_blocking=True)
+        for batch_idx, (context_indices, targets_indices, actions) in enumerate(pbar):
+            context_indices = context_indices.to(device, non_blocking=True)
+            targets_indices = targets_indices.to(device, non_blocking=True)
             actions = actions.to(device, non_blocking=True)
             
             with torch.amp.autocast("cuda", dtype=torch.float16, enabled=(device.type == "cuda")):
                 if args.rollout_length == 1:
-                    target_zq = targets_zq[:, 0]
+                    target_indices = targets_indices[:, 0]
                     action = actions[:, 0]
                     loss = training_step(
-                        model, context_zq, target_zq, action,
+                        model, context_indices, target_indices, action, codebook,
                         diffusion_forcing=args.diffusion_forcing,
                         max_context_noise=args.max_context_noise
                     )
                 else:
                     loss = rollout_training_step(
-                        model, context_zq, targets_zq, actions,
-                        p_ss=epoch_ss_prob,
-                        rollout_ode_steps=args.rollout_ode_steps,
+                        model, context_indices, targets_indices, actions,
                         codebook=codebook,
+                        p_ss=epoch_ss_prob,
+                        temperature=args.temperature,
+                        rollout_ode_steps=args.rollout_ode_steps,
                         diffusion_forcing=args.diffusion_forcing,
                         max_context_noise=args.max_context_noise
                     )
@@ -500,11 +561,13 @@ def train(args):
         
         epoch_time = time.time() - epoch_start
         avg_epoch_loss = epoch_loss / max(len(train_loader), 1)
-        print(f"\nEpoch {epoch+1} train (avg) | loss: {avg_epoch_loss:.4f} | time: {epoch_time:.1f}s")
+        train_ppl = math.exp(avg_epoch_loss)
+        print(f"\nEpoch {epoch+1} train (avg) | loss: {avg_epoch_loss:.4f} | ppl: {train_ppl:.1f} | time: {epoch_time:.1f}s")
 
         current_lr = optimizer.param_groups[0]["lr"]
         train_log = {
-            M.train_loss("Velocity MSE"): avg_epoch_loss,
+            M.train_loss("Token CE"): avg_epoch_loss,
+            M.train_perplexity(): train_ppl,
             M.learning_rate(): current_lr,
         }
         if args.rollout_length > 1:
@@ -518,19 +581,25 @@ def train(args):
         val_loss = validate(
             model, val_loader, device,
             rollout_length=args.rollout_length,
-            rollout_ode_steps=args.rollout_ode_steps,
             codebook=codebook,
+            temperature=args.temperature,
+            rollout_ode_steps=args.rollout_ode_steps,
             diffusion_forcing=args.diffusion_forcing,
             max_context_noise=args.max_context_noise
         )
-        print(f"Epoch {epoch+1} val   (avg) | loss: {val_loss:.4f}")
+        val_ppl = math.exp(val_loss)
+        print(f"Epoch {epoch+1} val   (avg) | loss: {val_loss:.4f} | ppl: {val_ppl:.1f}")
         
-        wb.log({M.val_loss("Velocity MSE"): val_loss}, step=epoch_step)
+        wb.log({
+            M.val_loss("Token CE"): val_loss,
+            M.val_perplexity(): val_ppl,
+        }, step=epoch_step)
 
         if vqvae_model is not None:
             orchestrator.run_dynamics_epoch_eval(
                 model, vqvae_model, eval_val_loader,
                 epoch_step, epoch_step, codebook,
+                temperature=args.temperature,
                 max_one_step_batches=args.max_one_step_batches,
             )
         
@@ -550,6 +619,9 @@ def train(args):
                 "cond_dim": args.cond_dim,
                 "num_actions": args.num_actions,
                 "attn_resolution": args.attn_resolution,
+                "num_embeddings": args.num_embeddings,
+                "bottleneck_dim": args.bottleneck_dim,
+                "temperature": args.temperature,
                 "lr": args.lr,
                 "batch_size": args.batch_size,
                 "max_samples": args.max_samples,
@@ -625,6 +697,10 @@ def parse_args():
                         help="Number of action classes")
     parser.add_argument("--attn_resolution", type=int, default=8,
                         help="Resolution at which to apply self-attention")
+    parser.add_argument("--num_embeddings", type=int, default=1024,
+                        help="Number of codebook entries (token vocabulary size)")
+    parser.add_argument("--bottleneck_dim", type=int, default=64,
+                        help="Bottleneck channels before 1x1 logit projection")
     
     # Training
     parser.add_argument("--epochs", type=int, default=100,
@@ -653,8 +729,10 @@ def parse_args():
     # Rollout training & scheduled sampling
     parser.add_argument("--rollout_length", type=int, default=1,
                         help="Number of frames to predict in rollout (1 = single-step, 2-4 = multi-step)")
-    parser.add_argument("--rollout_ode_steps", type=int, default=3,
-                        help="ODE integration steps for prediction generation during rollout training")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Sampling temperature for scheduled sampling and eval-time generation")
+    parser.add_argument("--rollout_ode_steps", type=int, default=4,
+                        help="ODE integration steps for scheduled sampling predictions during rollout training")
     parser.add_argument("--ss_start_epoch", type=int, default=20,
                         help="Epoch to start scheduled sampling")
     parser.add_argument("--ss_max_prob", type=float, default=0.5,

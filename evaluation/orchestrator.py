@@ -33,6 +33,7 @@ def _rollout_latent_batch(
     num_ode_steps: int,
     device: torch.device,
     codebook: Optional[torch.Tensor],
+    temperature: float,
 ) -> torch.Tensor:
     """
     Batched autoregressive rollout.
@@ -57,10 +58,12 @@ def _rollout_latent_batch(
             num_steps=num_ode_steps,
             device=device,
             codebook=codebook,
+            temperature=temperature,
         )
-        generated_steps_cpu.append(z_next.detach().cpu())
-        context = torch.cat([context[:, 1:], z_next.unsqueeze(1)], dim=1)
-        del z_next
+        z_next_embed, _ = z_next
+        generated_steps_cpu.append(z_next_embed.detach().cpu())
+        context = torch.cat([context[:, 1:], z_next_embed.unsqueeze(1)], dim=1)
+        del z_next_embed
         _cuda_cleanup(device)
 
     return torch.stack(generated_steps_cpu, dim=1)
@@ -181,9 +184,13 @@ class EvalOrchestrator:
         epoch: int,
         global_step: int,
         codebook: Optional[torch.Tensor] = None,
+        temperature: float = 1.0,
         max_one_step_batches: int = 50,
     ) -> Dict[str, float]:
         from dynamics.inference import predict_next_frame
+
+        if codebook is None:
+            raise ValueError("codebook is required for discrete dynamics evaluation.")
 
         model.eval()
         vqvae_model.eval()
@@ -196,25 +203,29 @@ class EvalOrchestrator:
         fake_images_np: list = []
 
         for batch in val_loader:
-            context_zq, targets_zq, actions = batch
-            context_one = context_zq[:1].to(self.device, non_blocking=True)
-            if targets_zq.dim() == 5:
-                target_zq = targets_zq[:1, 0].to(self.device, non_blocking=True)
+            context_indices, targets_indices, actions = batch
+            context_one_idx = context_indices[:1].to(self.device, non_blocking=True)
+            context_one = codebook[context_one_idx].permute(0, 1, 4, 2, 3)
+            if targets_indices.dim() == 4:
+                target_indices = targets_indices[:1, 0].to(self.device, non_blocking=True)
             else:
-                target_zq = targets_zq[:1].to(self.device, non_blocking=True)
+                target_indices = targets_indices[:1].to(self.device, non_blocking=True)
             if actions.dim() == 2:
                 action = actions[0, 0].to(self.device, non_blocking=True)
             else:
                 action = actions[0].to(self.device, non_blocking=True)
 
             with torch.no_grad():
-                pred_zq = predict_next_frame(
+                pred_zq, pred_indices = predict_next_frame(
                     model, context_one, action.item(),
-                    num_steps=self.eval_ode_steps, device=self.device, codebook=codebook,
+                    num_steps=self.eval_ode_steps,
+                    device=self.device,
+                    codebook=codebook,
+                    temperature=temperature,
                 )
 
-            gt_decoded = vqvae_model.decode(target_zq)
-            pred_decoded = vqvae_model.decode(pred_zq[:1])
+            gt_decoded = vqvae_model.decode_indices(target_indices)
+            pred_decoded = vqvae_model.decode_indices(pred_indices[:1])
 
             from evaluation.single_frame_metrics import evaluate_single_frame
             frame_metrics = evaluate_single_frame(pred_decoded, gt_decoded)
@@ -229,7 +240,7 @@ class EvalOrchestrator:
                     real_images_np.append(real_np[i])
                     fake_images_np.append(fake_np[i])
 
-            del context_one, target_zq, action, pred_zq, gt_decoded, pred_decoded, frame_metrics
+            del context_one, target_indices, action, pred_zq, pred_indices, gt_decoded, pred_decoded, frame_metrics
             _cuda_cleanup(self.device)
             num_batches += 1
 
@@ -260,7 +271,7 @@ class EvalOrchestrator:
         if heavy:
             self._run_heavy_dynamics_eval(
                 model, vqvae_model, val_loader, epoch,
-                codebook, all_metrics,
+                codebook, all_metrics, temperature,
             )
 
         self.logger.log(all_metrics, step=global_step)
@@ -275,8 +286,11 @@ class EvalOrchestrator:
         epoch: int,
         codebook: Optional[torch.Tensor],
         results: Dict[str, float],
+        temperature: float,
     ) -> None:
         from dynamics.inference import predict_next_frame
+        if codebook is None:
+            raise ValueError("codebook is required for heavy dynamics evaluation.")
 
         horizons = self.cfg.short_horizons
         fvd_horizons = self.cfg.fvd_clip_lengths if self.cfg.should_run_metric("fvd", epoch) else []
@@ -297,16 +311,17 @@ class EvalOrchestrator:
 
         count = 0
         for batch in val_loader:
-            context_zq, targets_zq, actions = batch
+            context_indices, targets_indices, actions = batch
 
-            B = context_zq.shape[0]
+            B = context_indices.shape[0]
             for start in range(0, B, stream_batch_size):
                 if count >= num_eval_sequences:
                     break
                 chunk_cap = min(stream_batch_size, num_eval_sequences - count)
                 end = min(start + chunk_cap, B)
 
-                ctx_chunk = context_zq[start:end].to(self.device, non_blocking=True)
+                ctx_chunk_idx = context_indices[start:end].to(self.device, non_blocking=True)
+                ctx_chunk = codebook[ctx_chunk_idx].permute(0, 1, 4, 2, 3)
                 actions_chunk = actions[start:end]
 
                 if actions_chunk.dim() == 2:
@@ -327,11 +342,13 @@ class EvalOrchestrator:
                     num_ode_steps=self.eval_ode_steps,
                     device=self.device,
                     codebook=codebook,
+                    temperature=temperature,
                 )
                 gen_chunk_cpu = gen_chunk.detach().cpu()
 
-                if targets_zq.dim() == 5:
-                    gt_chunk_cpu = targets_zq[start:end, :gen_chunk_cpu.shape[1]].detach().cpu()
+                if targets_indices.dim() == 4:
+                    target_chunk_idx = targets_indices[start:end, :gen_chunk_cpu.shape[1]].to(self.device, non_blocking=True)
+                    gt_chunk_cpu = codebook[target_chunk_idx].permute(0, 1, 4, 2, 3).detach().cpu()
                 else:
                     gt_chunk_cpu = None
                 action_seq_cpu = action_seq.detach().cpu()
