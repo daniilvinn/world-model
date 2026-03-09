@@ -3,12 +3,12 @@
     "metric_overrides": {
         "fid": {
             "frequency": 5,
-            "num_samples": 5000,
+            "num_samples": 2500,
             "min_samples": 2
         },
         "fvd": {
             "frequency": 5,
-            "num_samples": 1000
+            "num_samples": 250
         },
         "optical_flow": {
             "frequency": 0
@@ -50,7 +50,7 @@
     "rollout": {
         "short_horizons": [8],
         "long_horizons": [128],
-        "fvd_clip_lengths": [16, 64, 512]
+        "fvd_clip_lengths": [16, 64, 256]
     },
     "gradient_stats": {
         "enabled": true,
@@ -61,7 +61,7 @@
         }
     },
     "runtime_profiling": {
-        "enabled": true,
+        "enabled": false,
         "frequency": 1
     },
     "artifacts": {

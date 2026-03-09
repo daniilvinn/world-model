@@ -830,7 +830,7 @@ class Game:
         self.screen.blit(rotated_cube, cube_rect)
         
         # Draw UI
-        if not self.collecting_data:
+        if not self.collecting_data and False:
             if self.is_dead:
                 text = self.font.render(f'DEAD - Score: {self.score} | Press R to Restart', 
                                        True, self.DEAD_COLOR)

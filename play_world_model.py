@@ -39,6 +39,7 @@ class WorldModelGame:
         display_size=(840, 420),
         solver="euler",
         temperature=1.0,
+        top_k=None,
         compile_models=True,
     ):
         """
@@ -50,11 +51,13 @@ class WorldModelGame:
             seed_index:          which seed to use (None = random)
             display_size:        (width, height) of the pygame window
             solver:              "euler" or "midpoint"
+            top_k:               top-k token sampling (None or <=0 disables)
             compile_models:      whether to compile models with torch.compile
         """
         self.ode_steps = ode_steps
         self.solver = solver
         self.temperature = temperature
+        self.top_k = top_k
         self.display_size = display_size
         
         # Set up PyTorch
@@ -92,6 +95,7 @@ class WorldModelGame:
         # Load seeds
         print(f"Loading seeds from {seeds_path}...")
         self.seeds = torch.load(seeds_path, map_location=self.device)['contexts']
+        self.seeds = self._align_seed_contexts(self.seeds)
         self.num_seeds = self.seeds.shape[0]
         print(f"Loaded {self.num_seeds} seed sequences")
         
@@ -126,14 +130,50 @@ class WorldModelGame:
         model.eval()
         
         return model
+
+    def _expected_context_length(self):
+        """Read expected context length from raw or compiled model."""
+        if hasattr(self.dynamics_model, "context_length"):
+            return int(getattr(self.dynamics_model, "context_length"))
+        orig_mod = getattr(self.dynamics_model, "_orig_mod", None)
+        if orig_mod is not None and hasattr(orig_mod, "context_length"):
+            return int(getattr(orig_mod, "context_length"))
+        return None
+
+    def _align_seed_contexts(self, contexts):
+        """
+        Align seed context length to what dynamics model expects.
+
+        If too short, left-pad with the oldest frame.
+        If too long, keep the most recent frames.
+        """
+        expected = self._expected_context_length()
+        if expected is None:
+            return contexts
+
+        current = contexts.shape[1]
+        if current == expected:
+            return contexts
+        if current > expected:
+            print(f"Trimming seed context length from {current} to {expected}")
+            return contexts[:, -expected:]
+
+        pad_frames = expected - current
+        print(f"Padding seed context length from {current} to {expected}")
+        oldest = contexts[:, :1]
+        pad = oldest.expand(-1, pad_frames, -1, -1, -1)
+        return torch.cat([pad, contexts], dim=1)
     
     def _load_dynamics(self, checkpoint_path):
         """Load dynamics model from checkpoint (with EMA weights)."""
         ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         config = ckpt.get("config", {})
+        context_length = config.get("context_length", 4)
+        latent_dim = config.get("latent_dim", 16)
+        in_channels = config.get("in_channels", latent_dim * (1 + context_length))
         
         model = DynamicsUNet(
-            in_channels=16 + 16 * config.get("context_length", 4),
+            in_channels=in_channels,
             num_embeddings=config.get("num_embeddings", 1024),
             bottleneck_dim=config.get("bottleneck_dim", 64),
             base_channels=config.get("base_channels", 128),
@@ -148,7 +188,6 @@ class WorldModelGame:
         if "ema_state_dict" in ckpt:
             print("Loading EMA weights...")
             ema_weights = ckpt["ema_state_dict"]
-            # EMA weights are stored as a dict of tensors, need to convert to state_dict format
             model_state = {}
             for name, param in model.named_parameters():
                 if name in ema_weights:
@@ -177,6 +216,7 @@ class WorldModelGame:
             device=self.device,
             codebook=self.codebook,
             temperature=self.temperature,
+            top_k=self.top_k,
         )
     
     def _decode_to_pixels(self, z):
@@ -289,6 +329,8 @@ def main():
                         help="ODE solver (midpoint is 2x slower but more accurate)")
     parser.add_argument("--temperature", type=float, default=1.0,
                         help="Sampling temperature for dynamics logits (>0 stochastic, <=0 argmax)")
+    parser.add_argument("--top_k", type=int, default=None,
+                        help="Top-k token sampling for dynamics logits (None or <=0 disables)")
     parser.add_argument("--seed_index", type=int, default=None,
                         help="Specific seed index (default: random)")
     parser.add_argument("--width", type=int, default=840,
@@ -319,6 +361,7 @@ def main():
         display_size=(args.width, args.height),
         solver=args.solver,
         temperature=args.temperature,
+        top_k=args.top_k,
         compile_models=not args.no_compile,
     )
     

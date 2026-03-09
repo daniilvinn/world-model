@@ -24,8 +24,11 @@ from logger.metric_names import M
 def _load_dynamics(checkpoint_path, device):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt.get("config", {})
+    context_length = cfg.get("context_length", 4)
+    latent_dim = cfg.get("latent_dim", 16)
+    in_channels = cfg.get("in_channels", latent_dim * (1 + context_length))
     model = DynamicsUNet(
-        in_channels=16 + 16 * cfg.get("context_length", 4),
+        in_channels=in_channels,
         num_embeddings=cfg.get("num_embeddings", 1024),
         bottleneck_dim=cfg.get("bottleneck_dim", 64),
         base_channels=cfg.get("base_channels", 128),

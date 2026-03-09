@@ -3,6 +3,7 @@
 import argparse
 import math
 import os
+import tempfile
 import time
 import warnings
 
@@ -12,10 +13,12 @@ warnings.filterwarnings('ignore', category=UserWarning)
 
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from tqdm import tqdm
 
 from dynamics.model import DynamicsUNet
 from dynamics.dataset import create_dataloaders
+from dynamics.inference import rollout
 
 from evaluation.config import load_eval_config
 from evaluation.orchestrator import EvalOrchestrator
@@ -310,6 +313,99 @@ def validate(model, val_loader, device, rollout_length=1,
     return avg_loss
 
 
+@torch.no_grad()
+def generate_rollout_video(
+    model,
+    ema,
+    vqvae_model,
+    val_loader,
+    codebook,
+    device,
+    num_frames=32,
+    num_actions=2,
+    ode_steps=10,
+    temperature=1.0,
+    eval_chunk_size=16,
+    fps=10,
+):
+    """
+    Generate a short random rollout GIF and return its file path.
+    """
+    num_val_batches = len(val_loader)
+    if num_val_batches == 0 or num_frames <= 0:
+        return None
+
+    random_batch_idx = torch.randint(0, num_val_batches, (1,)).item()
+    sampled_batch = None
+    for batch_idx, batch in enumerate(val_loader):
+        if batch_idx == random_batch_idx:
+            sampled_batch = batch
+            break
+
+    if sampled_batch is None:
+        return None
+
+    context_indices, _, _ = sampled_batch
+    if context_indices.shape[0] == 0:
+        return None
+    sample_idx = torch.randint(0, context_indices.shape[0], (1,)).item()
+    context_one_idx = context_indices[sample_idx:sample_idx + 1].to(device, non_blocking=True)
+    context_one = codebook[context_one_idx].permute(0, 1, 4, 2, 3)
+
+    action_seq = torch.randint(0, num_actions, (num_frames,), device=device, dtype=torch.long)
+    was_training = model.training
+    gif_path = None
+
+    try:
+        ema.store(model)
+        ema.apply_shadow(model)
+        model.eval()
+        vqvae_model.eval()
+
+        rollout_latents = rollout(
+            model,
+            context_one,
+            action_seq,
+            num_ode_steps=ode_steps,
+            device=device,
+            codebook=codebook,
+            temperature=temperature,
+        )
+
+        decoded_chunks = []
+        chunk_size = max(1, int(eval_chunk_size))
+        for start in range(0, rollout_latents.shape[0], chunk_size):
+            end = min(start + chunk_size, rollout_latents.shape[0])
+            latent_chunk = rollout_latents[start:end].to(device, non_blocking=True)
+            decoded_chunks.append(vqvae_model.decode(latent_chunk).detach().cpu())
+
+        if not decoded_chunks:
+            return None
+
+        decoded = torch.cat(decoded_chunks, dim=0)  # [T, 3, 256, 512]
+        video_uint8 = ((decoded.clamp(-1, 1) + 1.0) * 127.5).byte()
+        frames = [Image.fromarray(video_uint8[i].permute(1, 2, 0).numpy()) for i in range(video_uint8.shape[0])]
+        if not frames:
+            return None
+
+        with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp_file:
+            gif_path = tmp_file.name
+
+        frame_duration_ms = max(1, int(1000 / max(1, int(fps))))
+        frames[0].save(
+            gif_path,
+            save_all=True,
+            append_images=frames[1:],
+            duration=frame_duration_ms,
+            loop=0,
+        )
+        return gif_path
+    finally:
+        ema.restore(model)
+        if was_training:
+            model.train()
+
+
 def train(args):
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -332,6 +428,13 @@ def train(args):
     
     codebook = codebook.detach().to(device)
     
+    # Get latent_dim from VQ-VAE config so dynamics input channels match (latent_dim for target + context)
+    vqvae_ckpt = torch.load(args.vqvae_checkpoint, map_location="cpu", weights_only=False)
+    vqvae_cfg = vqvae_ckpt.get("config", {})
+    latent_dim = vqvae_cfg.get("latent_dim", 16)
+    in_channels = latent_dim * (1 + args.context_length)
+    print(f"VQ-VAE latent_dim={latent_dim} -> dynamics in_channels={in_channels}")
+    
     steps_per_epoch = len(train_loader)
     total_steps = steps_per_epoch * args.epochs
     print(f"Steps per epoch: {steps_per_epoch}, Total steps: {total_steps}")
@@ -339,7 +442,7 @@ def train(args):
     
     # Model
     model = DynamicsUNet(
-        in_channels=16 + 16 * args.context_length,
+        in_channels=in_channels,
         num_embeddings=args.num_embeddings,
         bottleneck_dim=args.bottleneck_dim,
         base_channels=args.base_channels,
@@ -393,6 +496,8 @@ def train(args):
         "num_actions": args.num_actions,
         "attn_resolution": args.attn_resolution,
         "num_embeddings": args.num_embeddings,
+        "latent_dim": latent_dim,
+        "in_channels": in_channels,
         "bottleneck_dim": args.bottleneck_dim,
         "temperature": args.temperature,
         "lr": args.lr,
@@ -426,7 +531,7 @@ def train(args):
     )
 
     wb.log_architecture(model, "Dynamics UNet", extra_metadata={
-        "in_channels": 16 + 16 * args.context_length,
+        "in_channels": in_channels,
         "out_channels": args.num_embeddings,
         "bottleneck_dim": args.bottleneck_dim,
         "spatial_path": "32x32 -> 16x16 -> 8x8 -> 16x16 -> 32x32",
@@ -602,6 +707,34 @@ def train(args):
                 temperature=args.temperature,
                 max_one_step_batches=args.max_one_step_batches,
             )
+
+        if vqvae_model is not None and wb.enabled:
+            rollout_gif_path = generate_rollout_video(
+                model=model,
+                ema=ema,
+                vqvae_model=vqvae_model,
+                val_loader=val_loader,
+                codebook=codebook,
+                device=device,
+                num_frames=32,
+                num_actions=args.num_actions,
+                ode_steps=args.eval_ode_steps,
+                temperature=args.temperature,
+                eval_chunk_size=args.eval_chunk_size,
+                fps=10,
+            )
+            if rollout_gif_path is not None:
+                wb.log_video(
+                    M.dynamics_rollout_video(),
+                    rollout_gif_path,
+                    step=epoch_step,
+                    caption=f"epoch={epoch_step}, frames=32, random policy",
+                    fps=10,
+                )
+                try:
+                    os.remove(rollout_gif_path)
+                except OSError:
+                    pass
         
         checkpoint = {
             "epoch": epoch,
@@ -620,6 +753,8 @@ def train(args):
                 "num_actions": args.num_actions,
                 "attn_resolution": args.attn_resolution,
                 "num_embeddings": args.num_embeddings,
+                "latent_dim": latent_dim,
+                "in_channels": in_channels,
                 "bottleneck_dim": args.bottleneck_dim,
                 "temperature": args.temperature,
                 "lr": args.lr,

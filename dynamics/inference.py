@@ -67,13 +67,14 @@ def quantize_latent(z, codebook):
     return z_q
 
 
-def _sample_indices_from_logits(logits, temperature=1.0):
+def _sample_indices_from_logits(logits, temperature=1.0, top_k=None):
     """
     Sample discrete token indices from logits.
 
     Args:
         logits: [B, K, H, W]
         temperature: >0 for stochastic sampling, <=0 for argmax
+        top_k: if set (>0), sample only from top-k logits per position
 
     Returns:
         indices: [B, H, W] long
@@ -81,7 +82,14 @@ def _sample_indices_from_logits(logits, temperature=1.0):
     if temperature <= 0:
         return logits.argmax(dim=1)
 
-    probs = torch.softmax(logits / temperature, dim=1)
+    sampling_logits = logits / temperature
+    if top_k is not None and top_k > 0:
+        k = min(int(top_k), sampling_logits.shape[1])
+        topk_vals, _ = torch.topk(sampling_logits, k, dim=1)
+        kth_vals = topk_vals[:, -1:, :, :]
+        sampling_logits = sampling_logits.masked_fill(sampling_logits < kth_vals, float("-inf"))
+
+    probs = torch.softmax(sampling_logits, dim=1)
     B, K, H, W = probs.shape
     probs_flat = probs.permute(0, 2, 3, 1).reshape(-1, K)
     sampled = torch.multinomial(probs_flat, num_samples=1).squeeze(1)
@@ -131,6 +139,7 @@ def predict_next_frame(
     device="cuda",
     codebook=None,
     temperature=1.0,
+    top_k=None,
     context_noise_levels=None,
 ):
     """
@@ -145,6 +154,7 @@ def predict_next_frame(
         device: torch device
         codebook: [K, C] VQ-VAE codebook embeddings (required)
         temperature: sampling temperature for final token sampling (>0 stochastic, <=0 argmax)
+        top_k: if set (>0), sample final tokens only from top-k logits per position
         context_noise_levels: None, scalar, [ctx_len], or [B, ctx_len] noise levels in [0, 1]
     
     Returns:
@@ -224,7 +234,7 @@ def predict_next_frame(
     # Sample final tokens from logits at t=1, then map back to codebook embeddings.
     t_final = torch.full((B,), 1.0 - 1e-4, device=device)
     logits_final = model(x, t_final, context_flat, action_tensor)
-    indices = _sample_indices_from_logits(logits_final, temperature=temperature)
+    indices = _sample_indices_from_logits(logits_final, temperature=temperature, top_k=top_k)
     z_q = codebook[indices].permute(0, 3, 1, 2)
     
     return z_q, indices
@@ -240,6 +250,7 @@ def rollout(
     device="cuda",
     codebook=None,
     temperature=1.0,
+    top_k=None,
     context_noise_levels=None,
     context_noise_schedule=None,
 ):
@@ -255,6 +266,7 @@ def rollout(
         device: torch device
         codebook: [K, C] VQ-VAE codebook embeddings (required)
         temperature: sampling temperature for logits (>0 stochastic, <=0 argmax)
+        top_k: if set (>0), sample final tokens only from top-k logits per position
         context_noise_levels: None, scalar, [ctx_len], or [B, ctx_len] noise levels in [0, 1]
         context_noise_schedule: optional list of noise_levels per rollout step (len = actions)
     
@@ -280,6 +292,7 @@ def rollout(
             device,
             codebook,
             temperature=temperature,
+            top_k=top_k,
             context_noise_levels=step_noise_levels,
         )
         generated.append(z_next)

@@ -206,7 +206,8 @@ class DynamicsUNet(nn.Module):
     """
     Small U-Net for flow matching on 32x32 VQ-VAE latents.
     
-    Input channels: 16 (noisy target) + 16*context_length (context frames) = 80 (for context_length=4)
+    Input channels: latent_dim (noisy target) + latent_dim*context_length (context frames)
+                    = latent_dim * (1 + context_length). E.g. 80 for latent_dim=16, context_length=4.
     Output channels: num_embeddings (token logits)
     
     Spatial path: 32x32 -> 16x16 -> 8x8 -> 16x16 -> 32x32
@@ -321,9 +322,9 @@ class DynamicsUNet(nn.Module):
     def forward(self, x_t, t, context, action):
         """
         Args:
-            x_t:     [B, 16, 32, 32] noisy target latent at flow time t
+            x_t:     [B, C, 32, 32] noisy target latent at flow time t (C = latent_dim)
             t:       [B] flow time in [0, 1]
-            context: [B, context_length*16, 32, 32] concatenated context frames
+            context: [B, context_length*C, 32, 32] concatenated context frames
             action:  [B] int action index (0 or 1)
         
         Returns:

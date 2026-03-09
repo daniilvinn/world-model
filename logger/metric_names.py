@@ -66,6 +66,10 @@ class M:
         return f"{Namespace.EVALUATION}/FVD-{n}"
 
     @staticmethod
+    def dynamics_rollout_video() -> str:
+        return f"{Namespace.EVALUATION}/Dynamics Rollout Video"
+
+    @staticmethod
     def codebook_perplexity() -> str:
         return f"{Namespace.EVALUATION}/Codebook Perplexity"
 
